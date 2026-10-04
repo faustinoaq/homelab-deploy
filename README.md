@@ -98,8 +98,18 @@ Global flags: `--json`, `--dry-run`.
 }
 ```
 
-Dockerfile-only projects use `"port"` (host) and `"container_port"`. CLI flags override
-the manifest. See `examples/`.
+Other keys:
+
+* `"port"` / `"container_port"` – Dockerfile-only projects (host port / port inside the container).
+* `"env_files"` – which untracked env files to copy (default: every `.env*` except `*.example`).
+* `"health_path"` – path the smoke test requests (default `/`; any status except 404/5xx counts as up).
+
+CLI flags override the manifest. See `examples/`.
+
+### Monorepos
+
+Run `hl deploy path/to/app` on a subdirectory with its own `homelab.json`: the whole repo is
+cloned, the build runs in that subdirectory, and `--watch` only rebuilds when a push touches it.
 
 ## Using it from an AI agent
 
