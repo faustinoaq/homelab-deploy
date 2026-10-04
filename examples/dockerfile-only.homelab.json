@@ -1,0 +1,7 @@
+{
+  "name": "tinyapi",
+  "host": "docker3",
+  "port": 3100,
+  "container_port": 8080,
+  "routes": { "tinyapi": 3100 }
+}

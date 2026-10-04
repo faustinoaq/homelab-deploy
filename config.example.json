@@ -1,0 +1,14 @@
+{
+  "jump": "user@192.168.0.10",
+  "apps_dir": "apps",
+  "default_host": "docker1",
+  "hosts": {
+    "docker1": { "ip": "192.168.122.10", "user": "deploy", "note": "runs cloudflared" },
+    "docker2": { "ip": "192.168.122.11", "user": "deploy" }
+  },
+  "cloudflare": {
+    "tunnel_id": "00000000-0000-0000-0000-000000000000",
+    "zone": "example.com",
+    "zone_id": "0123456789abcdef0123456789abcdef"
+  }
+}

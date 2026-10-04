@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""hl - git-based deploys to a homelab, published through a Cloudflare tunnel.
+
+Designed to be driven by humans and LLM agents alike:
+  * every command accepts --json for machine-readable output
+  * every mutating command accepts --dry-run
+  * no interactive prompts, non-zero exit code on failure
+
+Flow of `hl deploy`:
+  local git repo --push--> GitHub --clone/pull (read-only deploy key)--> VM ~/apps/<name>
+  --> docker compose up -d --build --> tunnel ingress + DNS --> HTTPS smoke test
+Optional `--watch` installs a cron job on the VM so every push to GitHub redeploys.
+
+Topology is described in the config file (see config.example.json):
+  laptop --ssh--> jump host --ssh--> docker VMs; a remotely-managed cloudflared tunnel
+  routes <sub>.<zone> -> http://<vm-ip>:<port>.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hl"
+CONFIG_CANDIDATES = [
+    os.environ.get("HL_CONFIG"),
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hl/config.json",
+    ROOT / "config.json",
+]
+MANIFEST = "homelab.json"  # per-project manifest name
+
+JSON_OUT = False
+DRY_RUN = False
+
+
+class HLError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- output
+
+def log(msg):
+    print(f"hl: {msg}", file=sys.stderr)
+
+
+def emit(data, human=None):
+    if JSON_OUT or human is None:
+        print(json.dumps(data, indent=2))
+    else:
+        print(human)
+
+
+def run(argv, check=True, **kw):
+    kw.setdefault("text", True)
+    kw.setdefault("capture_output", True)
+    r = subprocess.run(argv, **kw)
+    if check and r.returncode != 0:
+        raise HLError(f"{argv[0]} {' '.join(argv[1:3])} failed: {(r.stderr or r.stdout or '').strip()}")
+    return r
+
+
+# ---------------------------------------------------------------- preflight
+
+_checked = {}
+
+
+def require(tool):
+    """Fail early (once) when a CLI is missing or not logged in."""
+    if tool in _checked:
+        return
+    if not shutil.which(tool):
+        hint = {"cf": "npm i -g cf  (Cloudflare CLI), then `cf auth login`",
+                "gh": "https://cli.github.com, then `gh auth login`"}.get(tool, "")
+        raise HLError(f"`{tool}` not found on PATH. {hint}")
+    if tool == "cf":
+        r = run(["cf", "auth", "whoami"], check=False)
+        try:
+            ok = json.loads(r.stdout).get("tokenValid")
+        except (json.JSONDecodeError, AttributeError):
+            ok = False
+        if not ok:
+            raise HLError("cf is not logged in: run `cf auth login`")
+    if tool == "gh" and run(["gh", "auth", "status"], check=False).returncode != 0:
+        raise HLError("gh is not logged in: run `gh auth login`")
+    _checked[tool] = True
+
+
+# ---------------------------------------------------------------- config
+
+def load_config():
+    for c in CONFIG_CANDIDATES:
+        if c and Path(c).exists():
+            return json.loads(Path(c).read_text())
+    raise HLError("no config found; copy config.example.json to ~/.config/hl/config.json")
+
+
+def host_cfg(cfg, name):
+    name = name or cfg.get("default_host")
+    if name not in cfg["hosts"]:
+        raise HLError(f"unknown host '{name}', known: {', '.join(cfg['hosts'])}")
+    return name, cfg["hosts"][name]
+
+
+def fqdn(cfg, name):
+    zone = cfg["cloudflare"]["zone"]
+    return name if name == zone or name.endswith("." + zone) or "." in name else f"{name}.{zone}"
+
+
+def app_dir(cfg, name):
+    return f"{cfg.get('apps_dir', 'apps')}/{name}"
+
+
+# ---------------------------------------------------------------- ssh
+
+def ssh_opts(cfg):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    opts = [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={STATE_DIR}/cm-%r@%h:%p",
+        "-o", "ControlPersist=120",
+    ]
+    if cfg.get("jump"):
+        opts += ["-J", cfg["jump"]]
+    return opts
+
+
+def ssh_target(h):
+    return f"{h['user']}@{h['ip']}"
+
+
+def ssh(cfg, h, command, check=True, mutating=False, stdin=None, stream=False):
+    """Run a command on a VM. With stdin, `command` is typically `sh -s` and stdin the script."""
+    if mutating and DRY_RUN:
+        shown = stdin.strip()[:400] if stdin is not None and command == "sh -s" else command  # never echo data/secrets
+        log(f"[dry-run] on {ssh_target(h)}: {shown}")
+        return ""
+    argv = ["ssh", *ssh_opts(cfg), ssh_target(h), command]
+    if stream and not JSON_OUT:
+        r = subprocess.run(argv, text=True, input=stdin, stdout=sys.stderr, stderr=subprocess.STDOUT)
+        out = ""
+    else:
+        r = subprocess.run(argv, text=True, input=stdin, capture_output=True)
+        out = (r.stdout or "") + (r.stderr or "" if stream else "")
+    if check and r.returncode != 0:
+        detail = out[-3000:] if out else (r.stderr or "").strip() if not stream else "(see output above)"
+        raise HLError(f"ssh {ssh_target(h)} failed ({r.returncode}):\n{detail}")
+    return r.stdout if not stream else out
+
+
+# ---------------------------------------------------------------- cloudflare (via `cf` CLI)
+
+def cf(*args, body=None, mutating=False):
+    require("cf")
+    argv = ["cf", *args, "-q"]
+    if body is not None:
+        argv += ["--body", json.dumps(body)]
+    if mutating and DRY_RUN:
+        argv.append("--dry-run")
+    r = run(argv, check=False)
+    if r.returncode != 0:
+        raise HLError(f"cf {' '.join(args[:3])} failed: {r.stderr.strip() or r.stdout.strip()}")
+    out = r.stdout.strip()
+    try:
+        return json.loads(out) if out else None
+    except json.JSONDecodeError:
+        return out
+
+
+def tunnel_config(cfg):
+    return cf("tunnels", "config", "get", cfg["cloudflare"]["tunnel_id"])
+
+
+def put_ingress(cfg, current, ingress):
+    backup = None
+    if not DRY_RUN:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        backup = STATE_DIR / f"tunnel-config-v{current.get('version')}-{int(time.time())}.json"
+        backup.write_text(json.dumps(current, indent=2))
+    new_cfg = dict(current["config"])
+    new_cfg["ingress"] = ingress
+    cf("tunnels", "config", "update", cfg["cloudflare"]["tunnel_id"],
+       body={"config": new_cfg}, mutating=True)
+    return str(backup) if backup else None
+
+
+def ensure_dns(cfg, host, force=False):
+    zone_id = cfg["cloudflare"]["zone_id"]
+    target = f"{cfg['cloudflare']['tunnel_id']}.cfargotunnel.com"
+    for r in cf("dns", "records", "list", "-z", zone_id, "--name", host) or []:
+        if r["type"] == "CNAME" and r["content"] == target:
+            return "exists"
+        if not force:
+            raise HLError(f"DNS {host} already exists as {r['type']} -> {r['content']} (use --force to replace)")
+        cf("dns", "records", "delete", r["id"], "-z", zone_id, mutating=True)
+    cf("dns", "records", "create", "-z", zone_id, mutating=True, body={
+        "type": "CNAME", "name": host, "content": target, "proxied": True, "comment": "managed by hl",
+    })
+    return "created"
+
+
+def remove_dns(cfg, host):
+    zone_id = cfg["cloudflare"]["zone_id"]
+    target = f"{cfg['cloudflare']['tunnel_id']}.cfargotunnel.com"
+    removed = 0
+    for r in cf("dns", "records", "list", "-z", zone_id, "--name", host) or []:
+        if r["type"] == "CNAME" and r["content"] == target:
+            cf("dns", "records", "delete", r["id"], "-z", zone_id, mutating=True)
+            removed += 1
+    return removed
+
+
+def do_expose(cfg, name, hostname, port, force=False, connect_timeout=None):
+    _, h = host_cfg(cfg, hostname)
+    host = fqdn(cfg, name)
+    service = f"http://{h['ip']}:{int(port)}"
+    current = tunnel_config(cfg)
+    ingress = list(current["config"]["ingress"])
+    rule = {"hostname": host, "service": service}
+    if connect_timeout:
+        rule["originRequest"] = {"connectTimeout": connect_timeout}
+    existing = next((r for r in ingress if r.get("hostname") == host), None)
+    backup = None
+    if existing and existing["service"] == service:
+        ingress_action = "unchanged"
+    else:
+        if existing and not force:
+            raise HLError(f"{host} already routes to {existing['service']} (use --force to repoint)")
+        if existing:
+            existing.update(rule)
+            ingress_action = "updated"
+        else:
+            # keep the catch-all (rule without hostname) last
+            idx = next((i for i, r in enumerate(ingress) if "hostname" not in r), len(ingress))
+            ingress.insert(idx, rule)
+            ingress_action = "added"
+        backup = put_ingress(cfg, current, ingress)
+    dns_action = ensure_dns(cfg, host, force=force)
+    return {"hostname": host, "url": f"https://{host}", "service": service,
+            "ingress": ingress_action, "dns": dns_action, "backup": backup, "dry_run": DRY_RUN}
+
+
+# ---------------------------------------------------------------- git / github
+
+def git(src, *args, check=True):
+    return run(["git", "-C", str(src), *args], check=check).stdout.strip()
+
+
+def github_repo(url):
+    m = re.match(r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([^/]+)/(.+?)(?:\.git)?/?$", url)
+    if not m:
+        raise HLError(f"origin is not a GitHub repo: {url}")
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def local_env_files(src):
+    """Untracked .env files that must travel out-of-band (never through git)."""
+    files = []
+    for p in sorted(src.glob(".env*")):
+        if not p.is_file() or p.name.endswith((".example", ".sample", ".template")):
+            continue
+        if git(src, "ls-files", "--error-unmatch", p.name, check=False):
+            continue  # tracked: it already comes with the clone
+        files.append(p)
+    return files
+
+
+def ensure_deploy_key(cfg, h, hostname, name, repo):
+    """Per-app ed25519 key on the VM, registered as a read-only GitHub deploy key."""
+    q = shlex.quote
+    key = f"$HOME/.ssh/hl_{name}"
+    if DRY_RUN:
+        log(f"[dry-run] ensure deploy key ~/.ssh/hl_{name} on {hostname} registered on {repo}")
+        return "dry-run"
+    pub = ssh(cfg, h, "sh -s", stdin=f"""set -e
+mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+[ -f "{key}" ] || ssh-keygen -q -t ed25519 -N '' -C {q(f'hl-{hostname}-{name}')} -f "{key}"
+cat "{key}.pub"
+""").strip()
+    material = " ".join(pub.split()[:2])
+    keys = json.loads(run(["gh", "repo", "deploy-key", "list", "-R", repo, "--json", "key"]).stdout or "[]")
+    if any(" ".join(k["key"].split()[:2]) == material for k in keys):
+        return "exists"
+    with tempfile.NamedTemporaryFile("w", suffix=".pub", delete=False) as f:
+        f.write(pub + "\n")
+    try:
+        run(["gh", "repo", "deploy-key", "add", f.name, "-R", repo, "-t", f"hl {hostname}/{name}"])
+    finally:
+        os.unlink(f.name)
+    return "added"
+
+
+def remote_scripts(name, branch, up_cmd):
+    pull = f"""#!/bin/sh
+# generated by hl: fetch origin/{branch}, redeploy if it moved (used by cron and `hl deploy`)
+set -e
+cd "$(dirname "$0")/../.."
+if command -v flock >/dev/null; then exec 9>.git/hl/lock; flock -n 9 || exit 0; fi
+git fetch -q origin {shlex.quote(branch)}
+if [ "$1" != "--force" ] && [ "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" ]; then exit 0; fi
+git reset -q --hard FETCH_HEAD
+echo "$(date '+%F %T') deploying {name} @ $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
+exec .git/hl/up.sh
+"""
+    up = f"""#!/bin/sh
+# generated by hl: build and (re)start {name}
+set -e
+cd "$(dirname "$0")/../.."
+{up_cmd}
+"""
+    hook = """#!/bin/sh
+# generated by hl: a manual `git pull` on the server also redeploys
+exec "$(git rev-parse --git-dir)/hl/up.sh"
+"""
+    return pull, up, hook
+
+
+def write_files_script(base, files):
+    parts = []
+    for path, content, mode in files:
+        tag = "HL_EOF_" + re.sub(r"\W", "_", path).upper()
+        parts.append(f"cat > \"{base}/{path}\" <<'{tag}'\n{content}{tag}\nchmod {mode} \"{base}/{path}\"")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_doctor(cfg, a):
+    checks = []
+
+    def check(name, fn):
+        try:
+            checks.append({"check": name, "ok": True, "detail": fn()})
+        except Exception as e:  # noqa: BLE001
+            checks.append({"check": name, "ok": False, "detail": str(e).strip()})
+
+    check("cf", lambda: (require("cf"), "logged in")[1])
+    check("gh", lambda: (require("gh"), "logged in")[1])
+    check("git", lambda: run(["git", "--version"]).stdout.strip())
+    check("tunnel", lambda: f"version {tunnel_config(cfg)['version']}")
+    if cfg.get("jump"):
+        check("jump host", lambda: run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                                        cfg["jump"], "hostname"]).stdout.strip())
+    probe = r"""
+hostname
+id -nG | tr ' ' '\n' | grep -qx docker && echo 'docker-group ok' || echo 'MISSING: user not in docker group'
+docker info >/dev/null 2>&1 && echo 'docker ok' || echo 'MISSING: docker daemon not usable'
+docker compose version >/dev/null 2>&1 && echo 'compose ok' || echo 'MISSING: docker compose v2'
+command -v git >/dev/null && echo 'git ok' || echo 'MISSING: git'
+command -v crontab >/dev/null && echo 'cron ok' || echo 'missing (only for --watch): crontab'
+"""
+    for name, h in cfg["hosts"].items():
+        def vm(h=h):
+            out = ssh(cfg, h, "sh -s", stdin=probe).strip().splitlines()
+            if any(l.startswith("MISSING") for l in out):
+                raise HLError(" | ".join(out))
+            return " | ".join(out)
+        check(f"{name}", vm)
+    ok = all(c["ok"] for c in checks)
+    human = "\n".join(f"{'OK ' if c['ok'] else 'ERR'}  {c['check']:<10} {c['detail']}" for c in checks)
+    emit({"ok": ok, "checks": checks}, human)
+    return 0 if ok else 1
+
+
+def cmd_routes(cfg, a):
+    c = tunnel_config(cfg)
+    ip2host = {h["ip"]: n for n, h in cfg["hosts"].items()}
+    rows = []
+    for r in c["config"]["ingress"]:
+        svc = r["service"]
+        vm = next((n for ip, n in ip2host.items() if f"//{ip}:" in svc), "")
+        rows.append({"hostname": r.get("hostname", "*"), "service": svc, "host": vm})
+    human = "\n".join(f"{r['hostname']:<34} {r['service']:<32} {r['host']}" for r in rows)
+    emit({"version": c["version"], "routes": rows}, human)
+
+
+def cmd_expose(cfg, a):
+    res = do_expose(cfg, a.name, a.host, a.port, force=a.force, connect_timeout=a.connect_timeout)
+    emit(res, f"{res['url']} -> {res['service']}  (ingress {res['ingress']}, dns {res['dns']})"
+               + ("  [dry-run]" if DRY_RUN else ""))
+
+
+def cmd_unexpose(cfg, a):
+    host = fqdn(cfg, a.name)
+    current = tunnel_config(cfg)
+    ingress = [r for r in current["config"]["ingress"] if r.get("hostname") != host]
+    if len(ingress) == len(current["config"]["ingress"]):
+        raise HLError(f"no ingress rule for {host}")
+    backup = put_ingress(cfg, current, ingress)
+    dns = 0 if a.keep_dns else remove_dns(cfg, host)
+    emit({"hostname": host, "removed": True, "dns_removed": dns, "backup": backup, "dry_run": DRY_RUN},
+         f"removed {host} (dns records removed: {dns})" + ("  [dry-run]" if DRY_RUN else ""))
+
+
+def cmd_ps(cfg, a):
+    hosts = [host_cfg(cfg, a.host)] if a.host else list(cfg["hosts"].items())
+    out = []
+    for name, h in hosts:
+        try:
+            for line in ssh(cfg, h, "docker ps -a --format '{{json .}}'").splitlines():
+                d = json.loads(line)
+                labels = d.get("Labels") or ""
+                project = labels.split("com.docker.compose.project=")[1].split(",")[0] \
+                    if "com.docker.compose.project=" in labels else ""
+                out.append({"host": name, "name": d["Names"], "image": d["Image"], "status": d["Status"],
+                            "ports": d["Ports"], "project": project})
+        except HLError as e:
+            out.append({"host": name, "error": str(e).strip().splitlines()[-1]})
+    human = "\n".join(
+        f"{r['host']:<8} ERROR {r['error']}" if "error" in r else
+        f"{r['host']:<8} {r['name']:<30} {r['status']:<24} {r['ports']}" for r in out)
+    emit(out, human)
+
+
+def cmd_ports(cfg, a):
+    name, h = host_cfg(cfg, a.host)
+    raw = ssh(cfg, h, "(ss -Hltn 2>/dev/null || netstat -ltn) | awk '{print $4}' | sed 's/.*://'")
+    ports = sorted({int(p) for p in raw.split() if p.isdigit()})
+    emit({"host": name, "listening": ports}, f"{name} listening TCP ports: {' '.join(map(str, ports))}")
+
+
+def load_manifest(path):
+    m = Path(path) / MANIFEST
+    return json.loads(m.read_text()) if m.exists() else {}
+
+
+def up_command(src, name, compose, m, routes):
+    q = shlex.quote
+    if compose:
+        services = " ".join(q(s) for s in m.get("services", []))
+        return f"docker compose -p {q(name)} -f {q(compose)} up -d --build --remove-orphans {services}".strip()
+    if len(routes) > 1:
+        raise HLError("Dockerfile-only deploy supports a single route; use compose for more")
+    port = m.get("port") or next(iter(routes.values()), None)
+    if not port:
+        raise HLError("Dockerfile-only deploy needs a port: --route sub=PORT or manifest 'port'")
+    cport = m.get("container_port", port)
+    envf = "--env-file .env" if (src / ".env").exists() else ""
+    return (f"docker build -t {q(name)}:latest .\n"
+            f"docker rm -f {q(name)} >/dev/null 2>&1 || true\n"
+            f"docker run -d --name {q(name)} --restart unless-stopped {envf} -p {int(port)}:{int(cport)} {q(name)}:latest")
+
+
+def cmd_deploy(cfg, a):
+    src = Path(a.path).resolve()
+    if not src.is_dir():
+        raise HLError(f"not a directory: {src}")
+    m = load_manifest(src)
+    name = a.name or m.get("name") or src.name.lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        raise HLError(f"invalid app name '{name}' (lowercase letters, digits, - and _)")
+    hostname, h = host_cfg(cfg, a.host or m.get("host"))
+    compose = a.compose or m.get("compose")
+    routes = dict(m.get("routes", {}))
+    for r in a.route or []:
+        sub, _, port = r.partition("=")
+        if not port.isdigit():
+            raise HLError(f"--route must be SUB=PORT, got '{r}'")
+        routes[sub] = int(port)
+    if not compose:
+        compose = next((c for c in ("docker-compose.prod.yml", "compose.prod.yaml", "docker-compose.yml",
+                                    "compose.yaml", "compose.yml") if (src / c).exists()), None)
+    if not compose and not (src / "Dockerfile").exists():
+        raise HLError("no compose file or Dockerfile found; add one or pass --compose")
+    watch = a.watch if a.watch is not None else m.get("watch", False)
+
+    # ---- 1. local preflight: git repo on GitHub, committed and pushed
+    require("gh")
+    if git(src, "rev-parse", "--is-inside-work-tree", check=False) != "true":
+        raise HLError(f"{src} is not a git repo (run `git init` and commit first)")
+    top = Path(git(src, "rev-parse", "--show-toplevel"))
+    if top != src:
+        raise HLError(f"deploy the repo root ({top}), not a subdirectory")
+    branch = m.get("branch") or git(src, "rev-parse", "--abbrev-ref", "HEAD")
+    origin = git(src, "remote", "get-url", "origin", check=False)
+    steps = []
+    if not origin:
+        if not a.create_repo:
+            raise HLError("no `origin` remote. Re-run with --create-repo to create a private GitHub repo via gh")
+        if DRY_RUN:
+            log(f"[dry-run] gh repo create {name} --private --source {src} --push")
+            origin = f"git@github.com:OWNER/{name}.git"
+        else:
+            run(["gh", "repo", "create", name, "--private", "--source", str(src), "--remote", "origin", "--push"])
+            origin = git(src, "remote", "get-url", "origin")
+        steps.append({"step": "github", "created": origin})
+    repo = github_repo(origin)
+    dirty = git(src, "status", "--porcelain")
+    if dirty and not a.allow_dirty:
+        raise HLError("uncommitted changes (commit them, or --allow-dirty to deploy the last commit):\n" + dirty)
+    if not DRY_RUN:
+        run(["git", "-C", str(src), "push", "-q", "origin", f"HEAD:refs/heads/{branch}"])
+    commit = git(src, "rev-parse", "--short", "HEAD")
+    steps.append({"step": "push", "repo": repo, "branch": branch, "commit": commit})
+
+    # ---- 2. VM: deploy key, clone, scripts, env files
+    key_state = ensure_deploy_key(cfg, h, hostname, name, repo)
+    steps.append({"step": "deploy-key", "state": key_state})
+    remote = app_dir(cfg, name)
+    up = up_command(src, name, compose, m, routes)
+    pull, up_sh, hook = remote_scripts(name, branch, up)
+    clone_url = f"git@github.com:{repo}.git"
+    setup = f"""set -e
+APP="$HOME/{remote}"
+export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/hl_{name} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+mkdir -p "$(dirname "$APP")"
+if [ ! -d "$APP/.git" ]; then
+  [ -e "$APP" ] && mv "$APP" "$APP.pre-hl.$(date +%s)"
+  git clone -q -b {shlex.quote(branch)} {clone_url} "$APP"
+fi
+cd "$APP"
+git remote set-url origin {clone_url}
+git config core.sshCommand "$GIT_SSH_COMMAND"
+mkdir -p .git/hl
+{write_files_script('.git', [('hl/pull.sh', pull, 755), ('hl/up.sh', up_sh, 755), ('hooks/post-merge', hook, 755)])}
+echo ok
+"""
+    ssh(cfg, h, "sh -s", stdin=setup, mutating=True)
+    steps.append({"step": "checkout", "dir": f"{hostname}:~/{remote}"})
+
+    env_files = local_env_files(src)
+    for p in env_files:
+        ssh(cfg, h, f"umask 077; cat > \"$HOME/{remote}/{p.name}\"", stdin=p.read_text(), mutating=True)
+    if env_files:
+        steps.append({"step": "env", "files": [p.name for p in env_files]})
+
+    # ---- 3. build + run (pull.sh --force: fetch, reset to origin, up.sh)
+    log(f"building {name}@{commit} on {hostname} ...")
+    ssh(cfg, h, f"\"$HOME/{remote}/.git/hl/pull.sh\" --force", mutating=True, stream=True)
+    steps.append({"step": "run", "command": up})
+
+    # ---- 4. auto-redeploy on push (cron poller; no inbound webhook needed)
+    if watch:
+        minutes = int(watch) if str(watch).isdigit() and int(watch) > 0 else 2
+        cron = (f"*/{minutes} * * * * $HOME/{remote}/.git/hl/pull.sh >> $HOME/{remote}/.git/hl/deploy.log 2>&1 # hl:{name}")
+        ssh(cfg, h, f"(crontab -l 2>/dev/null | grep -v '# hl:{name}$'; echo {shlex.quote(cron)}) | crontab -",
+            mutating=True)
+        steps.append({"step": "watch", "every_minutes": minutes})
+
+    # ---- 5. publish routes
+    published = [do_expose(cfg, sub, hostname, port, force=a.force) for sub, port in routes.items()]
+
+    # ---- 6. smoke test
+    checks = []
+    if not DRY_RUN and not a.no_check:
+        for p in published:
+            code = ""
+            for _ in range(12):
+                code = run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "10", p["url"]],
+                           check=False).stdout.strip()
+                if code[:1] in ("2", "3", "4") and code != "404":
+                    break
+                time.sleep(5)
+            checks.append({"url": p["url"], "status": code})
+
+    ok = all(c["status"][:1] in ("2", "3", "4") and c["status"] != "404" for c in checks)
+    res = {"ok": ok, "name": name, "host": hostname, "commit": commit, "steps": steps,
+           "routes": published, "checks": checks, "dry_run": DRY_RUN}
+    human = [f"deployed {name}@{commit} ({repo}:{branch}) to {hostname}:~/{remote}"
+             + ("  [dry-run]" if DRY_RUN else "")]
+    human += [f"  {p['url']} -> {p['service']}" for p in published]
+    human += [f"  check {c['url']}: HTTP {c['status']}" for c in checks]
+    if watch:
+        human.append("  auto-redeploy on push: enabled")
+    emit(res, "\n".join(human))
+    return 0 if ok else 2
+
+
+def cmd_unwatch(cfg, a):
+    hostname, h = host_cfg(cfg, a.host)
+    ssh(cfg, h, f"crontab -l 2>/dev/null | grep -v '# hl:{a.name}$' | crontab -", mutating=True)
+    emit({"name": a.name, "host": hostname, "watch": False}, f"auto-redeploy disabled for {a.name}")
+
+
+def cmd_logs(cfg, a):
+    hostname, h = host_cfg(cfg, a.host)
+    q = shlex.quote
+    if a.deploy:
+        cmd = f"tail -n {a.tail} \"$HOME/{app_dir(cfg, a.name)}/.git/hl/deploy.log\" 2>&1"
+    else:
+        cmd = (f"if [ -n \"$(docker compose -p {q(a.name)} ps -aq 2>/dev/null)\" ]; then "
+               f"docker compose -p {q(a.name)} logs --no-color --tail {a.tail} {q(a.service) if a.service else ''}; "
+               f"else docker logs --tail {a.tail} {q(a.name)}; fi 2>&1")
+    print(ssh(cfg, h, cmd, check=False))
+
+
+def cmd_down(cfg, a):
+    hostname, h = host_cfg(cfg, a.host)
+    q = shlex.quote
+    cmd = (f"docker compose -p {q(a.name)} down {'-v' if a.volumes else ''} 2>/dev/null; "
+           f"docker rm -f {q(a.name)} >/dev/null 2>&1; "
+           f"crontab -l 2>/dev/null | grep -v '# hl:{a.name}$' | crontab - 2>/dev/null; true")
+    ssh(cfg, h, cmd, mutating=True)
+    emit({"name": a.name, "host": hostname, "stopped": True, "dry_run": DRY_RUN},
+         f"stopped {a.name} on {hostname} (routes kept; `hl unexpose` to remove)" + ("  [dry-run]" if DRY_RUN else ""))
+
+
+def cmd_ssh_config(cfg, a):
+    lines = []
+    for name, h in cfg["hosts"].items():
+        lines += [f"Host {name}", f"  HostName {h['ip']}", f"  User {h['user']}"]
+        if cfg.get("jump"):
+            lines.append(f"  ProxyJump {cfg['jump']}")
+        lines.append("")
+    print("\n".join(lines))
+
+
+def cmd_exec(cfg, a):
+    _, h = host_cfg(cfg, a.host)
+    return subprocess.run(["ssh", *ssh_opts(cfg), ssh_target(h), " ".join(a.command)]).returncode
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv=None):
+    global JSON_OUT, DRY_RUN
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
+
+    p = argparse.ArgumentParser(prog="hl", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("doctor", parents=[common], help="check cf, gh, ssh, docker and git access")
+    sub.add_parser("routes", parents=[common], help="list tunnel ingress (public hostname -> vm:port)")
+
+    s = sub.add_parser("ps", parents=[common], help="list containers on one or all hosts")
+    s.add_argument("--host")
+
+    s = sub.add_parser("ports", parents=[common], help="list listening TCP ports on a host (pick a free one)")
+    s.add_argument("--host")
+
+    s = sub.add_parser("expose", parents=[common], help="publish <name>.<zone> -> host:port")
+    s.add_argument("name", help="subdomain or full hostname")
+    s.add_argument("port", type=int)
+    s.add_argument("--host", help="vm name (default from config)")
+    s.add_argument("--force", action="store_true", help="repoint an existing hostname / replace DNS")
+    s.add_argument("--connect-timeout", type=int)
+
+    s = sub.add_parser("unexpose", parents=[common], help="remove a public hostname")
+    s.add_argument("name")
+    s.add_argument("--keep-dns", action="store_true")
+
+    s = sub.add_parser("deploy", parents=[common], help="push to GitHub, pull on the VM, docker up, publish routes")
+    s.add_argument("path", nargs="?", default=".")
+    s.add_argument("--name", help="app/compose project name (default: manifest name or dir name)")
+    s.add_argument("--host")
+    s.add_argument("--compose", help="compose file relative to project")
+    s.add_argument("--route", action="append", metavar="SUB=PORT", help="publish SUB.<zone> -> host:PORT (repeatable)")
+    s.add_argument("--watch", nargs="?", const="2", default=None, metavar="MIN",
+                   help="redeploy automatically on every push (cron poll every MIN minutes, default 2)")
+    s.add_argument("--create-repo", action="store_true", help="create a private GitHub repo if there is no origin")
+    s.add_argument("--allow-dirty", action="store_true", help="deploy last commit even with uncommitted changes")
+    s.add_argument("--force", action="store_true", help="repoint existing hostnames / replace DNS records")
+    s.add_argument("--no-check", action="store_true", help="skip https smoke test")
+
+    s = sub.add_parser("unwatch", parents=[common], help="disable auto-redeploy on push")
+    s.add_argument("name")
+    s.add_argument("--host")
+
+    s = sub.add_parser("logs", parents=[common], help="container logs (or --deploy for the auto-deploy log)")
+    s.add_argument("name")
+    s.add_argument("--host")
+    s.add_argument("--service")
+    s.add_argument("--deploy", action="store_true")
+    s.add_argument("--tail", type=int, default=100)
+
+    s = sub.add_parser("down", parents=[common], help="stop an app and its auto-redeploy (keeps routes)")
+    s.add_argument("name")
+    s.add_argument("--host")
+    s.add_argument("--volumes", action="store_true", help="also delete its volumes (data loss!)")
+
+    sub.add_parser("ssh-config", parents=[common], help="print ~/.ssh/config entries for the vms")
+
+    s = sub.add_parser("exec", parents=[common], help="run a shell command on a host")
+    s.add_argument("--host")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+
+    a = p.parse_args(argv)
+    JSON_OUT, DRY_RUN = a.json, a.dry_run
+    try:
+        cfg = load_config()
+        return globals()[f"cmd_{a.cmd.replace('-', '_')}"](cfg, a) or 0
+    except HLError as e:
+        if JSON_OUT:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        log(f"error: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

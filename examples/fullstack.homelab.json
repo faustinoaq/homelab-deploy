@@ -1,0 +1,9 @@
+{
+  "name": "myapp",
+  "host": "docker3",
+  "branch": "main",
+  "compose": "docker-compose.prod.yml",
+  "services": ["db", "redis", "backend", "frontend"],
+  "routes": { "myapp": 3000, "myapp-api": 8000 },
+  "watch": true
+}
