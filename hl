@@ -80,7 +80,8 @@ def require(tool):
                 "gh": "https://cli.github.com, then `gh auth login`"}.get(tool, "")
         raise HLError(f"`{tool}` not found on PATH. {hint}")
     if tool == "cf":
-        r = run(["cf", "auth", "whoami"], check=False)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        r = run(["cf", "auth", "whoami"], check=False, cwd=STATE_DIR)
         try:
             ok = json.loads(r.stdout).get("tokenValid")
         except (json.JSONDecodeError, AttributeError):
@@ -166,7 +167,8 @@ def cf(*args, body=None, mutating=False):
         argv += ["--body", json.dumps(body)]
     if mutating and DRY_RUN:
         argv.append("--dry-run")
-    r = run(argv, check=False)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    r = run(argv, check=False, cwd=STATE_DIR)  # cf writes a .cloudflare/ cache into its cwd
     if r.returncode != 0:
         raise HLError(f"cf {' '.join(args[:3])} failed: {r.stderr.strip() or r.stdout.strip()}")
     out = r.stdout.strip()
