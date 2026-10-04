@@ -618,7 +618,10 @@ def cmd_ssh_config(cfg, a):
 
 def cmd_exec(cfg, a):
     _, h = host_cfg(cfg, a.host)
-    return subprocess.run(["ssh", *ssh_opts(cfg), ssh_target(h), " ".join(a.command)]).returncode
+    command = a.command[1:] if a.command[:1] == ["--"] else a.command
+    if not command:
+        raise HLError("usage: hl exec --host H -- COMMAND")
+    return subprocess.run(["ssh", *ssh_opts(cfg), ssh_target(h), " ".join(command)]).returncode
 
 
 # ---------------------------------------------------------------- main
