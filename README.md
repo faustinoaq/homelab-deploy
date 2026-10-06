@@ -36,7 +36,9 @@ Cloudflare tunnel (remotely managed): <sub>.<zone> ─▶ http://<vm-ip>:<port>
 6. **Build & run** – `docker compose -p <name> up -d --build --remove-orphans`
    (or `docker build` + `docker run` for Dockerfile-only projects).
 7. **Watch** (optional, `--watch`) – a cron job on the VM runs `pull.sh` every 2 minutes;
-   when `origin/<branch>` moved it resets and rebuilds. No inbound webhook needed.
+   when `origin/<branch>` moved it resets and rebuilds, unless every changed file is outside the
+   app's subdirectory or matches `ignore`. No inbound webhook needed. Changing the manifest needs
+   one `hl deploy` to regenerate the scripts on the VM.
 8. **Publish** – adds a tunnel ingress rule (before the catch-all) and a proxied CNAME.
 9. **Smoke test** – polls the HTTPS URL; exit code 2 if it never answers.
 
@@ -103,6 +105,9 @@ Other keys:
 * `"port"` / `"container_port"` – Dockerfile-only projects (host port / port inside the container).
 * `"env_files"` – which untracked env files to copy (default: every `.env*` except `*.example`).
 * `"health_path"` – path the smoke test requests (default `/`; any status except 404/5xx counts as up).
+* `"ignore"` – glob patterns (relative to the app directory) whose changes don't trigger an
+  auto-redeploy, e.g. `["docs/**", "*.md", "android/**"]`. A push redeploys only if at least one
+  changed file matches none of them. In these patterns `*` also matches `/`. `hl deploy` always deploys.
 
 CLI flags override the manifest. See `examples/`.
 

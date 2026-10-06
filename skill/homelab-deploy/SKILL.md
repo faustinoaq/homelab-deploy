@@ -13,7 +13,8 @@ Always pass `--json`. Run `hl --help` / `hl <cmd> --help` for flags.
    Avoid publishing database ports to the host. Create/fix these files if needed.
 3. Check `hl routes --json` and `hl ports --host <vm> --json`; never reuse a port or a hostname
    that belongs to another app.
-4. Write `homelab.json` in the project root (name, host, compose, routes, watch). Routes map
+4. Write `homelab.json` in the project root (name, host, compose, routes, watch, and `ignore`
+   globs such as `["docs/**", "*.md"]` for files that shouldn't trigger an auto-redeploy). Routes map
    subdomain → *host* port published by the container. Commit it.
 5. Secrets live in untracked `.env` files (hl copies them over SSH). Never commit or print them.
 6. `hl deploy <path> --dry-run --json`, review, then `hl deploy <path> --json`
