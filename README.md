@@ -35,7 +35,7 @@ Cloudflare tunnel (remotely managed): <sub>.<zone> ─▶ http://<vm-ip>:<port>
 5. **Secrets**: untracked `.env*` files are copied over SSH (mode 600), never committed.
 6. **Build & run**: `docker compose -p <name> up -d --build --remove-orphans`
    (or `docker build` + `docker run` for Dockerfile-only projects).
-7. **Watch** (optional, `--watch`) – a cron job on the VM runs `pull.sh` every 2 minutes;
+7. **Watch** (optional, `--watch`): a cron job on the VM runs `pull.sh` every 2 minutes;
    when `origin/<branch>` moved it resets and rebuilds, unless every changed file is outside the
    app's subdirectory or matches `ignore`. No inbound webhook needed. Changing the manifest needs
    one `hl deploy` to regenerate the scripts on the VM.
