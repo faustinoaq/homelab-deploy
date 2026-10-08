@@ -118,13 +118,9 @@ cloned, the build runs in that subdirectory, and `--watch` only rebuilds when a 
 
 ## Using it from an AI agent
 
-`skill/homelab-deploy/SKILL.md` is a [Claude Code skill](https://docs.claude.com/en/docs/claude-code/skills):
+`skill/homelab-deploy/SKILL.md` is a skill that you can setup to automate the usage.
 
-```bash
-ln -s "$PWD/skill/homelab-deploy" ~/.claude/skills/homelab-deploy
-```
-
-Other agents: point them at `hl --help` and tell them to always use `--json`.
+Also you can point to `hl --help` and always use `--json`.
 
 ## Safety
 
