@@ -7,7 +7,7 @@ description: Deploy a Dockerized project to the user's self-hosted homelab with 
 
 Always pass `--json`. Run `hl --help` / `hl <cmd> --help` for flags.
 
-1. `hl doctor --json` — if a check fails, stop and tell the user exactly what is missing.
+1. `hl doctor --json`: if a check fails, stop and tell the user exactly what is missing.
 2. The project must be a git repo whose root has a `Dockerfile` or compose file that runs in
    **production mode** (no `--reload` / `npm run dev`, bind `0.0.0.0`, `restart: unless-stopped`).
    Avoid publishing database ports to the host. Create/fix these files if needed.
@@ -18,7 +18,7 @@ Always pass `--json`. Run `hl --help` / `hl <cmd> --help` for flags.
    subdomain → *host* port published by the container. Commit it.
 5. Secrets live in untracked `.env` files (hl copies them over SSH). Never commit or print them.
 6. `hl deploy <path> --dry-run --json`, review, then `hl deploy <path> --json`
-   (`--create-repo` if there is no GitHub remote — it creates a *private* repo).
+   (`--create-repo` if there is no GitHub remote; it creates a *private* repo).
 7. Exit 0 = live. Exit 2 = running but the URL didn't answer → `hl logs <name> --json --tail 200`.
    Exit 1 = error, read `error`.
 

@@ -1,4 +1,4 @@
-# hl — git-push deploys to your homelab
+# hl: git-push deploys to your homelab
 
 A tiny, self-hosted alternative to Vercel/Netlify for people who already have a few
 Docker VMs at home and a Cloudflare tunnel. One Python file, stdlib only.
@@ -25,22 +25,22 @@ Cloudflare tunnel (remotely managed): <sub>.<zone> ─▶ http://<vm-ip>:<port>
 
 `hl deploy <dir>`:
 
-1. **Preflight** – `cf` and `gh` installed and logged in; the dir is a git repo root with
+1. **Preflight**: `cf` and `gh` installed and logged in; the dir is a git repo root with
    a GitHub `origin` (or `--create-repo` makes a private one); no uncommitted changes.
 2. **Push** the current branch to GitHub.
-3. **Deploy key** – creates `~/.ssh/hl_<name>` on the VM and registers it as a
+3. **Deploy key**: creates `~/.ssh/hl_<name>` on the VM and registers it as a
    *read-only* deploy key on the repo (`gh repo deploy-key add`). Idempotent.
-4. **Checkout** – clones into `~/apps/<name>` and installs `.git/hl/{pull,up}.sh` plus a
+4. **Checkout**: clones into `~/apps/<name>` and installs `.git/hl/{pull,up}.sh` plus a
    `post-merge` hook (so a manual `git pull` on the server redeploys too).
-5. **Secrets** – untracked `.env*` files are copied over SSH (mode 600), never committed.
-6. **Build & run** – `docker compose -p <name> up -d --build --remove-orphans`
+5. **Secrets**: untracked `.env*` files are copied over SSH (mode 600), never committed.
+6. **Build & run**: `docker compose -p <name> up -d --build --remove-orphans`
    (or `docker build` + `docker run` for Dockerfile-only projects).
 7. **Watch** (optional, `--watch`) – a cron job on the VM runs `pull.sh` every 2 minutes;
    when `origin/<branch>` moved it resets and rebuilds, unless every changed file is outside the
    app's subdirectory or matches `ignore`. No inbound webhook needed. Changing the manifest needs
    one `hl deploy` to regenerate the scripts on the VM.
-8. **Publish** – adds a tunnel ingress rule (before the catch-all) and a proxied CNAME.
-9. **Smoke test** – polls the HTTPS URL; exit code 2 if it never answers.
+8. **Publish**: adds a tunnel ingress rule (before the catch-all) and a proxied CNAME.
+9. **Smoke test**: polls the HTTPS URL; exit code 2 if it never answers.
 
 ## Requirements
 
@@ -102,10 +102,10 @@ Global flags: `--json`, `--dry-run`.
 
 Other keys:
 
-* `"port"` / `"container_port"` – Dockerfile-only projects (host port / port inside the container).
-* `"env_files"` – which untracked env files to copy (default: every `.env*` except `*.example`).
-* `"health_path"` – path the smoke test requests (default `/`; any status except 404/5xx counts as up).
-* `"ignore"` – glob patterns (relative to the app directory) whose changes don't trigger an
+* `"port"` / `"container_port"`: Dockerfile-only projects (host port / port inside the container).
+* `"env_files"`: which untracked env files to copy (default: every `.env*` except `*.example`).
+* `"health_path"`: path the smoke test requests (default `/`; any status except 404/5xx counts as up).
+* `"ignore"`: glob patterns (relative to the app directory) whose changes don't trigger an
   auto-redeploy, e.g. `["docs/**", "*.md", "android/**"]`. A push redeploys only if at least one
   changed file matches none of them. In these patterns `*` also matches `/`. `hl deploy` always deploys.
 
