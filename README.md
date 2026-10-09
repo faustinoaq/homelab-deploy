@@ -103,6 +103,7 @@ Global flags: `--json`, `--dry-run`.
 Other keys:
 
 * `"port"` / `"container_port"`: Dockerfile-only projects (host port / port inside the container).
+* `"cpus"` / `"memory"`: Dockerfile-only projects: limits for `docker run`, e.g. `"cpus": "0.25"`, `"memory": "128m"` (memory with no swap on top). Their logs are always rotated (10 MB x 3). Compose projects set limits in the compose file.
 * `"env_files"`: which untracked env files to copy (default: every `.env*` except `*.example`).
 * `"health_path"`: path the smoke test requests (default `/`; any status except 404/5xx counts as up).
 * `"ignore"`: glob patterns (relative to the app directory) whose changes don't trigger an

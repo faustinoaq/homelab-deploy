@@ -477,7 +477,23 @@ def up_command(src, name, compose, m, routes):
     envf = "--env-file .env" if (src / ".env").exists() else ""
     return (f"docker build -t {q(name)}:latest .\n"
             f"docker rm -f {q(name)} >/dev/null 2>&1 || true\n"
-            f"docker run -d --name {q(name)} --restart unless-stopped {envf} -p {int(port)}:{int(cport)} {q(name)}:latest")
+            f"docker run -d --name {q(name)} --restart unless-stopped {limit_flags(m)} {envf} -p {int(port)}:{int(cport)} {q(name)}:latest")
+
+
+def limit_flags(m):
+    """docker run limits from the manifest ("cpus": "0.25", "memory": "128m"), plus rotated logs
+    (10 MB x 3) so a chatty app can't fill the VM's disk. Compose apps set these in compose."""
+    flags = ["--log-opt max-size=10m", "--log-opt max-file=3"]
+    cpus, memory = m.get("cpus"), m.get("memory")
+    if cpus is not None:
+        if not re.fullmatch(r"\d+(\.\d+)?", str(cpus)):
+            raise HLError(f"manifest 'cpus' must be a number like 0.25, got '{cpus}'")
+        flags.append(f"--cpus {cpus}")
+    if memory is not None:
+        if not re.fullmatch(r"\d+[kmg]?", str(memory).lower()):
+            raise HLError(f"manifest 'memory' must look like 128m or 1g, got '{memory}'")
+        flags.append(f"--memory {str(memory).lower()} --memory-swap {str(memory).lower()}")
+    return " ".join(flags)
 
 
 def cmd_deploy(cfg, a):
