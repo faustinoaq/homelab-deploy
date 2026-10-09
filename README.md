@@ -4,9 +4,13 @@ A tiny, self-hosted alternative to Vercel/Netlify for people who already have a 
 Docker VMs at home and a Cloudflare tunnel. One Python file, stdlib only.
 
 ```
-hl deploy ~/code/myapp --route myapp=3100 --watch
-# → https://myapp.example.com, redeployed on every `git push`
+hl deploy ~/code/myapp --route myapp=3100
+# → https://myapp.example.com, deployed from your laptop over SSH
 ```
+
+Deploys are manual by default: nothing changes on the server unless you run `hl deploy`.
+`--watch` is opt-in and adds a cron poll that redeploys on every `git push`; it's convenient,
+but it means whatever lands on GitHub runs on your LAN, so weigh that first.
 
 Built to be driven by LLM agents as well as humans: every command has `--json` and
 `--dry-run`, nothing prompts, exit codes mean something, secrets are never echoed.
