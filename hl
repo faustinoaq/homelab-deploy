@@ -673,12 +673,19 @@ def cmd_exec(cfg, a):
 
 def main(argv=None):
     global JSON_OUT, DRY_RUN
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", help="machine-readable output")
-    common.add_argument("--dry-run", action="store_true", help="show what would change, change nothing")
+    def flags(default):
+        f = argparse.ArgumentParser(add_help=False)
+        f.add_argument("--json", action="store_true", default=default, help="machine-readable output")
+        f.add_argument("--dry-run", action="store_true", default=default,
+                       help="show what would change, change nothing")
+        return f
 
+    # Global flags work before or after the subcommand (`hl --dry-run deploy` == `hl deploy --dry-run`).
+    # The subcommand copies default to SUPPRESS: otherwise argparse lets its False overwrite a flag
+    # given before the subcommand, and `hl --dry-run deploy` would really deploy.
+    common = flags(argparse.SUPPRESS)
     p = argparse.ArgumentParser(prog="hl", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
+                                formatter_class=argparse.RawDescriptionHelpFormatter, parents=[flags(False)])
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", parents=[common], help="check cf, gh, ssh, docker and git access")
