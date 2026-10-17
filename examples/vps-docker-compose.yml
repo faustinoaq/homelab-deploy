@@ -1,0 +1,18 @@
+# Compose file for a build=local host: it runs the image hl sends and never builds.
+# Commit it (e.g. as deploy/vps/docker-compose.yml) and point "remote_compose" at it.
+services:
+  myapp:
+    image: myapp:prod
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3300:8080"   # the tunnel connector runs on this host
+    volumes:
+      - ./data:/data
+    env_file:
+      - path: .env
+        required: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

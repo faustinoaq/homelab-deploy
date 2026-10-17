@@ -1,9 +1,9 @@
 ---
 name: homelab-deploy
-description: Deploy a Dockerized project to the user's self-hosted homelab with the `hl` CLI and publish it on a Cloudflare-tunnel subdomain. Use instead of Vercel/Netlify/Fly whenever the user asks to deploy, host, publish or put an app online, or to inspect, log, stop or auto-redeploy an app running in the homelab.
+description: Deploy a Dockerized project to the user's homelab or VPS with the `hl` CLI and publish it on a Cloudflare-tunnel subdomain. Use instead of Vercel/Netlify/Fly whenever the user asks to deploy, host, publish or put an app online, to inspect, log, stop, roll back or auto-redeploy an app, or to move an app between hosts.
 ---
 
-# Deploying to the homelab with `hl`
+# Deploying with `hl`
 
 Always pass `--json`. Run `hl --help` / `hl <cmd> --help` for flags.
 
@@ -19,8 +19,15 @@ Always pass `--json`. Run `hl --help` / `hl <cmd> --help` for flags.
 5. Secrets live in untracked `.env` files (hl copies them over SSH). Never commit or print them.
 6. `hl deploy <path> --dry-run --json`, review, then `hl deploy <path> --json`
    (`--create-repo` if there is no GitHub remote; it creates a *private* repo).
+   Hosts with `"build": "local"` in the config (small VPSs, ARM) get an image built on this
+   machine: the manifest then needs `"image"` and, for compose, a committed `"remote_compose"`
+   file that uses that image and has no `build:`.
 7. Exit 0 = live. Exit 2 = running but the URL didn't answer → `hl logs <name> --json --tail 200`.
    Exit 1 = error, read `error`.
 
-Rules: ask the user before `--force` (repoints an existing hostname), `--allow-dirty`,
+Rollback (build=local only): `hl rollback <name> --host <h> --list --json`, then
+`hl rollback <name> --host <h> [--to <commit>]`. Moving an app between hosts: follow
+"Moving an app from the homelab to a VPS" in the README; `hl copy-data` moves data.
+
+Rules: ask the user before `hl copy-data --force`, `hl rollback`, `--force` (repoints an existing hostname), `--allow-dirty`,
 `hl down --volumes` (deletes data) or `hl unexpose`.

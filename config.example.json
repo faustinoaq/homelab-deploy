@@ -3,8 +3,17 @@
   "apps_dir": "apps",
   "default_host": "docker1",
   "hosts": {
-    "docker1": { "ip": "192.168.122.10", "user": "deploy", "note": "runs cloudflared" },
-    "docker2": { "ip": "192.168.122.11", "user": "deploy" }
+    "docker1": { "ip": "192.168.122.10", "user": "deploy", "note": "runs cloudflared for the homelab tunnel" },
+    "docker2": { "ip": "192.168.122.11", "user": "deploy" },
+    "vps": {
+      "ip": "100.64.0.5",
+      "user": "ubuntu",
+      "jump": null,
+      "build": "local",
+      "tunnel_id": "11111111-1111-1111-1111-111111111111",
+      "service_host": "localhost",
+      "note": "reached directly (e.g. over Tailscale); runs its own cloudflared connector"
+    }
   },
   "cloudflare": {
     "tunnel_id": "00000000-0000-0000-0000-000000000000",

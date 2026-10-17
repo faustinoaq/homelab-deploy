@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""hl - git-based deploys to a homelab, published through a Cloudflare tunnel.
+"""hl - deploys Docker apps to a homelab or a VPS, published through Cloudflare tunnels.
 
 Designed to be driven by humans and LLM agents alike:
   * every command accepts --json for machine-readable output
   * every mutating command accepts --dry-run
   * no interactive prompts, non-zero exit code on failure
 
-Flow of `hl deploy`:
-  local git repo --push--> GitHub --clone/pull (read-only deploy key)--> VM ~/apps/<name>
-  --> docker compose up -d --build --> tunnel ingress + DNS --> HTTPS smoke test
-Optional `--watch` installs a cron job on the VM so every push to GitHub redeploys.
+Two build modes for `hl deploy`:
+  build=remote  push to GitHub, the VM clones/pulls with a read-only deploy key and builds
+                (docker compose up -d --build). Optional `--watch` polls GitHub from cron.
+  build=local   this machine builds origin/<branch> for the VM's CPU architecture and streams
+                the image over SSH (docker save | docker load). The VM gets no repo, no GitHub
+                key and no build tools. Images are tagged per commit, so `hl rollback` works.
+Both end with: health check on the VM, tunnel ingress + DNS, HTTPS smoke test.
 
-Topology is described in the config file (see config.example.json):
-  laptop --ssh--> jump host --ssh--> docker VMs; a remotely-managed cloudflared tunnel
-  routes <sub>.<zone> -> http://<vm-ip>:<port>.
+Topology is described in the config file (see config.example.json). Each host can have its
+own SSH jump host (or none) and its own remotely-managed cloudflared tunnel, so homelab VMs
+behind one jump host and a VPS reached directly can live in the same config.
 """
 import argparse
 import json
@@ -109,6 +112,33 @@ def host_cfg(cfg, name):
     return name, cfg["hosts"][name]
 
 
+def host_jump(cfg, h):
+    """A host's own "jump" wins over the global one; "jump": null means connect directly."""
+    return h["jump"] if "jump" in h else cfg.get("jump")
+
+
+def tunnel_id(cfg, h):
+    return h.get("tunnel_id") or cfg["cloudflare"]["tunnel_id"]
+
+
+def all_tunnels(cfg):
+    ids = [cfg["cloudflare"]["tunnel_id"]] + [h["tunnel_id"] for h in cfg["hosts"].values() if h.get("tunnel_id")]
+    return list(dict.fromkeys(ids))
+
+
+def service_url(h, port):
+    """What cloudflared connects to. With a tunnel connector on the host itself, set
+    "service_host": "localhost" so apps can bind to 127.0.0.1 only."""
+    return f"http://{h.get('service_host', h['ip'])}:{int(port)}"
+
+
+def host_of_service(cfg, tid, service):
+    for n, h in cfg["hosts"].items():
+        if tunnel_id(cfg, h) == tid and service.startswith(f"http://{h.get('service_host', h['ip'])}:"):
+            return n
+    return ""
+
+
 def fqdn(cfg, name):
     zone = cfg["cloudflare"]["zone"]
     return name if name == zone or name.endswith("." + zone) or "." in name else f"{name}.{zone}"
@@ -120,7 +150,7 @@ def app_dir(cfg, name):
 
 # ---------------------------------------------------------------- ssh
 
-def ssh_opts(cfg):
+def ssh_opts(cfg, h):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     opts = [
         "-o", "BatchMode=yes",
@@ -130,8 +160,8 @@ def ssh_opts(cfg):
         "-o", f"ControlPath={STATE_DIR}/cm-%r@%h:%p",
         "-o", "ControlPersist=120",
     ]
-    if cfg.get("jump"):
-        opts += ["-J", cfg["jump"]]
+    if host_jump(cfg, h):
+        opts += ["-J", host_jump(cfg, h)]
     return opts
 
 
@@ -145,7 +175,7 @@ def ssh(cfg, h, command, check=True, mutating=False, stdin=None, stream=False):
         shown = stdin.strip()[:400] if stdin is not None and command == "sh -s" else command  # never echo data/secrets
         log(f"[dry-run] on {ssh_target(h)}: {shown}")
         return ""
-    argv = ["ssh", *ssh_opts(cfg), ssh_target(h), command]
+    argv = ["ssh", *ssh_opts(cfg, h), ssh_target(h), command]
     if stream and not JSON_OUT:
         r = subprocess.run(argv, text=True, input=stdin, stdout=sys.stderr, stderr=subprocess.STDOUT)
         out = ""
@@ -178,41 +208,56 @@ def cf(*args, body=None, mutating=False):
         return out
 
 
-def tunnel_config(cfg):
-    return cf("tunnels", "config", "get", cfg["cloudflare"]["tunnel_id"])
+def tunnel_config(cfg, tid):
+    return cf("tunnels", "config", "get", tid)
 
 
-def put_ingress(cfg, current, ingress):
+def put_ingress(cfg, tid, current, ingress):
     backup = None
     if not DRY_RUN:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        backup = STATE_DIR / f"tunnel-config-v{current.get('version')}-{int(time.time())}.json"
+        backup = STATE_DIR / f"tunnel-config-{tid[:8]}-v{current.get('version')}-{int(time.time())}.json"
         backup.write_text(json.dumps(current, indent=2))
     new_cfg = dict(current["config"])
     new_cfg["ingress"] = ingress
-    cf("tunnels", "config", "update", cfg["cloudflare"]["tunnel_id"],
-       body={"config": new_cfg}, mutating=True)
+    cf("tunnels", "config", "update", tid, body={"config": new_cfg}, mutating=True)
     return str(backup) if backup else None
 
 
-def ensure_dns(cfg, host, force=False):
+def find_route(cfg, host):
+    """(tunnel_id, rule) of the tunnel that currently routes `host`, or (None, None)."""
+    for tid in all_tunnels(cfg):
+        for r in tunnel_config(cfg, tid)["config"]["ingress"]:
+            if r.get("hostname") == host:
+                return tid, r
+    return None, None
+
+
+def ensure_dns(cfg, host, tid, force=False):
+    """Proxied CNAME host -> <tid>.cfargotunnel.com. Repointing from another target needs force."""
     zone_id = cfg["cloudflare"]["zone_id"]
-    target = f"{cfg['cloudflare']['tunnel_id']}.cfargotunnel.com"
-    for r in cf("dns", "records", "list", "-z", zone_id, "--name", host) or []:
+    target = f"{tid}.cfargotunnel.com"
+    records = cf("dns", "records", "list", "-z", zone_id, "--name", host) or []
+    for r in records:
         if r["type"] == "CNAME" and r["content"] == target:
             return "exists"
-        if not force:
-            raise HLError(f"DNS {host} already exists as {r['type']} -> {r['content']} (use --force to replace)")
+    if records and not force:
+        r = records[0]
+        raise HLError(f"DNS {host} already exists as {r['type']} -> {r['content']} (use --force to repoint)")
+    body = {"type": "CNAME", "name": host, "content": target, "proxied": True, "comment": "managed by hl"}
+    if len(records) == 1 and records[0]["type"] == "CNAME":
+        # edit in place: no window where the name doesn't resolve
+        cf("dns", "records", "edit", records[0]["id"], "-z", zone_id, body=body, mutating=True)
+        return "repointed"
+    for r in records:
         cf("dns", "records", "delete", r["id"], "-z", zone_id, mutating=True)
-    cf("dns", "records", "create", "-z", zone_id, mutating=True, body={
-        "type": "CNAME", "name": host, "content": target, "proxied": True, "comment": "managed by hl",
-    })
+    cf("dns", "records", "create", "-z", zone_id, body=body, mutating=True)
     return "created"
 
 
-def remove_dns(cfg, host):
+def remove_dns(cfg, host, tid):
     zone_id = cfg["cloudflare"]["zone_id"]
-    target = f"{cfg['cloudflare']['tunnel_id']}.cfargotunnel.com"
+    target = f"{tid}.cfargotunnel.com"
     removed = 0
     for r in cf("dns", "records", "list", "-z", zone_id, "--name", host) or []:
         if r["type"] == "CNAME" and r["content"] == target:
@@ -222,10 +267,18 @@ def remove_dns(cfg, host):
 
 
 def do_expose(cfg, name, hostname, port, force=False, connect_timeout=None):
+    """Route <name> to hostname:port through that host's tunnel. If another of our tunnels routes
+    the name (an app moving from the homelab to a VPS), --force moves it: the new rule is added,
+    DNS is repointed in place, then the old rule is removed."""
     _, h = host_cfg(cfg, hostname)
     host = fqdn(cfg, name)
-    service = f"http://{h['ip']}:{int(port)}"
-    current = tunnel_config(cfg)
+    tid = tunnel_id(cfg, h)
+    service = service_url(h, port)
+    old_tid, old_rule = find_route(cfg, host)
+    if old_tid and old_tid != tid and not force:
+        raise HLError(f"{host} is routed by tunnel {old_tid[:8]} to {old_rule['service']}; "
+                      f"use --force to move it to {hostname}")
+    current = tunnel_config(cfg, tid)
     ingress = list(current["config"]["ingress"])
     rule = {"hostname": host, "service": service}
     if connect_timeout:
@@ -245,10 +298,16 @@ def do_expose(cfg, name, hostname, port, force=False, connect_timeout=None):
             idx = next((i for i, r in enumerate(ingress) if "hostname" not in r), len(ingress))
             ingress.insert(idx, rule)
             ingress_action = "added"
-        backup = put_ingress(cfg, current, ingress)
-    dns_action = ensure_dns(cfg, host, force=force)
-    return {"hostname": host, "url": f"https://{host}", "service": service,
-            "ingress": ingress_action, "dns": dns_action, "backup": backup, "dry_run": DRY_RUN}
+        backup = put_ingress(cfg, tid, current, ingress)
+    dns_action = ensure_dns(cfg, host, tid, force=force)
+    moved_from = None
+    if old_tid and old_tid != tid:
+        old = tunnel_config(cfg, old_tid)
+        put_ingress(cfg, old_tid, old, [r for r in old["config"]["ingress"] if r.get("hostname") != host])
+        moved_from = {"tunnel": old_tid, "service": old_rule["service"]}
+    return {"hostname": host, "url": f"https://{host}", "service": service, "tunnel": tid,
+            "ingress": ingress_action, "dns": dns_action, "moved_from": moved_from,
+            "backup": backup, "dry_run": DRY_RUN}
 
 
 # ---------------------------------------------------------------- git / github
@@ -364,70 +423,99 @@ def write_files_script(base, files):
 
 # ---------------------------------------------------------------- commands
 
+ARCH_PLATFORM = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
+
+
 def cmd_doctor(cfg, a):
     checks = []
 
     def check(name, fn):
         try:
-            checks.append({"check": name, "ok": True, "detail": fn()})
+            detail = fn()
+            warn = isinstance(detail, str) and detail.startswith("WARN")
+            checks.append({"check": name, "ok": True, "warn": warn, "detail": detail})
         except Exception as e:  # noqa: BLE001
-            checks.append({"check": name, "ok": False, "detail": str(e).strip()})
+            checks.append({"check": name, "ok": False, "warn": False, "detail": str(e).strip()})
 
+    local_hosts = {n for n, h in cfg["hosts"].items() if h.get("build") == "local"}
     check("cf", lambda: (require("cf"), "logged in")[1])
     check("gh", lambda: (require("gh"), "logged in")[1])
     check("git", lambda: run(["git", "--version"]).stdout.strip())
-    check("tunnel", lambda: f"version {tunnel_config(cfg)['version']}")
-    if cfg.get("jump"):
-        check("jump host", lambda: run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-                                        cfg["jump"], "hostname"]).stdout.strip())
+    for tid in all_tunnels(cfg):
+        check(f"tunnel {tid[:8]}", lambda tid=tid: f"version {tunnel_config(cfg, tid)['version']}")
+    for jump in dict.fromkeys(host_jump(cfg, h) for h in cfg["hosts"].values() if host_jump(cfg, h)):
+        check(f"jump {jump}", lambda jump=jump: run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                                                     jump, "hostname"]).stdout.strip())
+    platforms = []
+    if local_hosts:
+        def local_docker():
+            ver = run(["docker", "version", "--format", "{{.Server.Version}} {{.Server.Arch}}"]).stdout.strip()
+            out = run(["docker", "buildx", "inspect"], check=False).stdout
+            line = next((l for l in out.splitlines() if l.strip().startswith("Platforms:")), "")
+            platforms.extend(p.strip() for p in line.split(":", 1)[-1].split(",") if p.strip())
+            return f"docker {ver}, can build: {', '.join(platforms) or 'unknown'}"
+        check("local docker", local_docker)
     probe = r"""
 hostname
+echo "arch $(uname -m)"
 id -nG | tr ' ' '\n' | grep -qx docker && echo 'docker-group ok' || echo 'MISSING: user not in docker group'
 docker info >/dev/null 2>&1 && echo 'docker ok' || echo 'MISSING: docker daemon not usable'
 docker compose version >/dev/null 2>&1 && echo 'compose ok' || echo 'MISSING: docker compose v2'
+"""
+    remote_probe = probe + r"""
 command -v git >/dev/null && echo 'git ok' || echo 'MISSING: git'
 command -v crontab >/dev/null && echo 'cron ok' || echo 'missing (only for --watch): crontab'
 """
     for name, h in cfg["hosts"].items():
-        def vm(h=h):
-            out = ssh(cfg, h, "sh -s", stdin=probe).strip().splitlines()
+        def vm(name=name, h=h):
+            out = ssh(cfg, h, "sh -s", stdin=probe if name in local_hosts else remote_probe).strip().splitlines()
             if any(l.startswith("MISSING") for l in out):
                 raise HLError(" | ".join(out))
-            return " | ".join(out)
+            arch = next((l.split()[1] for l in out if l.startswith("arch ")), "")
+            plat = ARCH_PLATFORM.get(arch, "")
+            if name in local_hosts and platforms and plat not in platforms:
+                return (f"WARN {' | '.join(out)} | local docker can't run {plat} build steps: only Dockerfiles "
+                        f"whose RUN steps use FROM --platform=$BUILDPLATFORM will build. To emulate: "
+                        f"docker run --privileged --rm tonistiigi/binfmt --install {plat.split('/')[-1]}")
+            return " | ".join(out) + (" | build local" if name in local_hosts else "")
         check(f"{name}", vm)
     ok = all(c["ok"] for c in checks)
-    human = "\n".join(f"{'OK ' if c['ok'] else 'ERR'}  {c['check']:<10} {c['detail']}" for c in checks)
+    human = "\n".join(f"{'ERR ' if not c['ok'] else 'WARN' if c['warn'] else 'OK  '} {c['check']:<16} "
+                      f"{c['detail'][5:] if c['warn'] else c['detail']}" for c in checks)
     emit({"ok": ok, "checks": checks}, human)
     return 0 if ok else 1
 
 
 def cmd_routes(cfg, a):
-    c = tunnel_config(cfg)
-    ip2host = {h["ip"]: n for n, h in cfg["hosts"].items()}
-    rows = []
-    for r in c["config"]["ingress"]:
-        svc = r["service"]
-        vm = next((n for ip, n in ip2host.items() if f"//{ip}:" in svc), "")
-        rows.append({"hostname": r.get("hostname", "*"), "service": svc, "host": vm})
-    human = "\n".join(f"{r['hostname']:<34} {r['service']:<32} {r['host']}" for r in rows)
-    emit({"version": c["version"], "routes": rows}, human)
+    rows, versions = [], {}
+    for tid in all_tunnels(cfg):
+        c = tunnel_config(cfg, tid)
+        versions[tid] = c["version"]
+        for r in c["config"]["ingress"]:
+            if "hostname" not in r:
+                continue  # catch-all
+            rows.append({"hostname": r["hostname"], "service": r["service"],
+                         "host": host_of_service(cfg, tid, r["service"]), "tunnel": tid})
+    human = "\n".join(f"{r['hostname']:<34} {r['service']:<32} {r['host']:<8} {r['tunnel'][:8]}" for r in rows)
+    emit({"versions": versions, "routes": rows}, human)
 
 
 def cmd_expose(cfg, a):
     res = do_expose(cfg, a.name, a.host, a.port, force=a.force, connect_timeout=a.connect_timeout)
-    emit(res, f"{res['url']} -> {res['service']}  (ingress {res['ingress']}, dns {res['dns']})"
+    moved = f", moved from {res['moved_from']['service']}" if res["moved_from"] else ""
+    emit(res, f"{res['url']} -> {res['service']}  (ingress {res['ingress']}, dns {res['dns']}{moved})"
                + ("  [dry-run]" if DRY_RUN else ""))
 
 
 def cmd_unexpose(cfg, a):
     host = fqdn(cfg, a.name)
-    current = tunnel_config(cfg)
-    ingress = [r for r in current["config"]["ingress"] if r.get("hostname") != host]
-    if len(ingress) == len(current["config"]["ingress"]):
+    tid, _ = find_route(cfg, host)
+    if not tid:
         raise HLError(f"no ingress rule for {host}")
-    backup = put_ingress(cfg, current, ingress)
-    dns = 0 if a.keep_dns else remove_dns(cfg, host)
-    emit({"hostname": host, "removed": True, "dns_removed": dns, "backup": backup, "dry_run": DRY_RUN},
+    current = tunnel_config(cfg, tid)
+    backup = put_ingress(cfg, tid, current, [r for r in current["config"]["ingress"] if r.get("hostname") != host])
+    dns = 0 if a.keep_dns else remove_dns(cfg, host, tid)
+    emit({"hostname": host, "tunnel": tid, "removed": True, "dns_removed": dns, "backup": backup, "dry_run": DRY_RUN},
          f"removed {host} (dns records removed: {dns})" + ("  [dry-run]" if DRY_RUN else ""))
 
 
@@ -496,61 +584,83 @@ def limit_flags(m):
     return " ".join(flags)
 
 
-def cmd_deploy(cfg, a):
-    src = Path(a.path).resolve()
-    if not src.is_dir():
-        raise HLError(f"not a directory: {src}")
-    m = load_manifest(src)
-    name = a.name or m.get("name") or src.name.lower()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
-        raise HLError(f"invalid app name '{name}' (lowercase letters, digits, - and _)")
-    hostname, h = host_cfg(cfg, a.host or m.get("host"))
-    compose = a.compose or m.get("compose")
-    routes = dict(m.get("routes", {}))
-    for r in a.route or []:
-        sub, _, port = r.partition("=")
-        if not port.isdigit():
-            raise HLError(f"--route must be SUB=PORT, got '{r}'")
-        routes[sub] = int(port)
-    if not compose:
-        compose = next((c for c in ("docker-compose.prod.yml", "compose.prod.yaml", "docker-compose.yml",
-                                    "compose.yaml", "compose.yml") if (src / c).exists()), None)
-    if not compose and not (src / "Dockerfile").exists():
-        raise HLError("no compose file or Dockerfile found; add one or pass --compose")
-    watch = a.watch if a.watch is not None else m.get("watch", False)
+SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+")
+IMAGE_RE = re.compile(r"[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?")
 
-    # ---- 1. local preflight: git repo on GitHub, committed and pushed
-    require("gh")
-    if git(src, "rev-parse", "--is-inside-work-tree", check=False) != "true":
-        raise HLError(f"{src} is not a git repo (run `git init` and commit first)")
-    top = Path(git(src, "rev-parse", "--show-toplevel"))
-    subdir = "" if top == src else src.relative_to(top).as_posix()  # monorepo app
-    branch = m.get("branch") or git(src, "rev-parse", "--abbrev-ref", "HEAD")
-    origin = git(src, "remote", "get-url", "origin", check=False)
-    steps = []
-    if not origin:
-        if not a.create_repo:
-            raise HLError("no `origin` remote. Re-run with --create-repo to create a private GitHub repo via gh")
-        if DRY_RUN:
-            log(f"[dry-run] gh repo create {name} --private --source {src} --push")
-            origin = f"git@github.com:OWNER/{name}.git"
-        else:
-            run(["gh", "repo", "create", name, "--private", "--source", str(src), "--remote", "origin", "--push"])
-            origin = git(src, "remote", "get-url", "origin")
-        steps.append({"step": "github", "created": origin})
-    repo = github_repo(origin)
+
+def sync_branch(src, branch, a):
+    """Decide what gets deployed. On the target branch: refuse uncommitted changes, push HEAD
+    (fast-forward only) and deploy it. On another branch, or with --no-push: deploy origin/<branch>
+    exactly as it is on GitHub and push nothing, so a feature branch can't land on main by accident."""
+    current = git(src, "rev-parse", "--abbrev-ref", "HEAD")
+    if a.no_push or current != branch:
+        if current != branch and not a.no_push:
+            log(f"on branch '{current}', not '{branch}': deploying origin/{branch} as it is, pushing nothing")
+        git(src, "fetch", "-q", "origin", branch)
+        sha = git(src, "rev-parse", f"origin/{branch}")
+        return sha, False
     dirty = git(src, "status", "--porcelain", "--", ".")
     if dirty and not a.allow_dirty:
         raise HLError("uncommitted changes (commit them, or --allow-dirty to deploy the last commit):\n" + dirty)
     if not DRY_RUN:
         run(["git", "-C", str(src), "push", "-q", "origin", f"HEAD:refs/heads/{branch}"])
-    commit = git(src, "rev-parse", "--short", "HEAD")
-    steps.append({"step": "push", "repo": repo, "branch": branch, "commit": commit})
+    return git(src, "rev-parse", "HEAD"), not DRY_RUN
 
-    # ---- 2. VM: deploy key, clone, scripts, env files
+
+def read_state(cfg, h, name):
+    raw = ssh(cfg, h, f"cat \"$HOME/.hl/apps/{name}.json\" 2>/dev/null || true").strip()
+    try:
+        return json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def write_state(cfg, h, name, state, message):
+    """Per-app record on the host (~/.hl/apps/<name>.json) used by `hl rollback` and `hl logs --deploy`."""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n"
+    ssh(cfg, h, f"mkdir -p \"$HOME/.hl/apps\" && cat > \"$HOME/.hl/apps/{name}.json\" && "
+                f"printf %s {shlex.quote(line)} >> \"$HOME/.hl/apps/{name}.log\"",
+        stdin=json.dumps(state, indent=2), mutating=True)
+
+
+def vm_health(cfg, h, name, ports, path, logs_cmd):
+    """Poll the app on the host itself (127.0.0.1:<port><path>) before checking the public URL, so a
+    broken release is reported with its logs instead of as a Cloudflare 502."""
+    if not ports:
+        return []
+    path = "/" + (path or "/").lstrip("/")
+    script = """set -e
+if command -v curl >/dev/null; then
+  status() { curl -s -o /dev/null -w '%{http_code}' -m 5 "$1" || true; }
+else  # busybox images (Alpine) ship wget only
+  status() { wget -q -S -T 5 -O /dev/null "$1" 2>&1 | awk '/HTTP\\//{c=$2} END{print c}'; }
+fi
+"""
+    for port in ports:
+        url = shlex.quote(f"http://127.0.0.1:{int(port)}{path}")
+        script += f"""ok=
+for i in $(seq 1 30); do
+  code=$(status {url})
+  case "$code" in ''|000|404|5*) sleep 2 ;; *) ok=1; echo "{port} $code"; break ;; esac
+done
+[ -n "$ok" ] || {{ echo "app not answering on 127.0.0.1:{port}{path} (last status: ${{code:-none}})"; {logs_cmd} 2>&1 | tail -30; exit 1; }}
+"""
+    if DRY_RUN:
+        log(f"[dry-run] health check on the host: {', '.join(f'127.0.0.1:{p}{path}' for p in ports)}")
+        return []
+    out = ssh(cfg, h, "sh -s", stdin=script, check=False)
+    lines = out.strip().splitlines()
+    results = [{"port": int(l.split()[0]), "status": l.split()[1]} for l in lines if re.fullmatch(r"\d+ \d+", l)]
+    if len(results) != len(ports):
+        raise HLError(f"health check failed on the host:\n{out.strip()}")
+    return results
+
+
+def deploy_remote(cfg, h, hostname, src, subdir, name, branch, repo, commit, compose, m, routes, watch, remote):
+    """build=remote: clone/pull on the host with a read-only deploy key and build there."""
+    steps = []
     key_state = ensure_deploy_key(cfg, h, hostname, name, repo)
     steps.append({"step": "deploy-key", "state": key_state})
-    remote = app_dir(cfg, name)
     up = up_command(src, name, compose, m, routes)
     pull, up_sh, hook = remote_scripts(name, branch, up, subdir, m.get("ignore", []))
     clone_url = f"git@github.com:{repo}.git"
@@ -579,23 +689,225 @@ echo ok
     if env_files:
         steps.append({"step": "env", "files": [p.name for p in env_files]})
 
-    # ---- 3. build + run (pull.sh --force: fetch, reset to origin, up.sh)
-    log(f"building {name}@{commit} on {hostname} ...")
+    log(f"building {name}@{commit[:7]} on {hostname} ...")
     ssh(cfg, h, f"\"$HOME/{remote}/.git/hl/pull.sh\" --force", mutating=True, stream=True)
     steps.append({"step": "run", "command": up})
 
-    # ---- 4. auto-redeploy on push (cron poller; no inbound webhook needed)
     if watch:
         minutes = int(watch) if str(watch).isdigit() and int(watch) > 0 else 2
         cron = (f"*/{minutes} * * * * $HOME/{remote}/.git/hl/pull.sh >> $HOME/{remote}/.git/hl/deploy.log 2>&1 # hl:{name}")
         ssh(cfg, h, f"(crontab -l 2>/dev/null | grep -v '# hl:{name}$'; echo {shlex.quote(cron)}) | crontab -",
             mutating=True)
         steps.append({"step": "watch", "every_minutes": minutes})
+    logs_cmd = f"cd \"$HOME/{workdir}\" && " + (f"docker compose -p {shlex.quote(name)} -f {shlex.quote(compose)} logs --no-color"
+                                                if compose else f"docker logs {shlex.quote(name)}")
+    return steps, up, workdir, logs_cmd
 
-    # ---- 5. publish routes
+
+def deploy_local(cfg, h, hostname, top, subdir, name, commit, compose, m, routes, remote):
+    """build=local: export the commit, build it here for the host's architecture, stream the image
+    over SSH and start it. Nothing but the image, the compose file and env files reaches the host."""
+    q = shlex.quote
+    steps = []
+    image = m.get("image") or f"{name}:latest"
+    if not IMAGE_RE.fullmatch(image):
+        raise HLError(f"invalid image name '{image}'")
+    repo_img = image.rsplit(":", 1)[0] if ":" in image.split("/")[-1] else image
+    if ":" not in image.split("/")[-1]:
+        image += ":latest"
+    commit_tag = f"{repo_img}:{commit[:12]}"
+    dockerfile = m.get("dockerfile", "Dockerfile")
+    remote_compose = m.get("remote_compose") or compose
+    for f in (dockerfile, remote_compose or "x"):
+        if not SAFE_PATH_RE.fullmatch(f) or ".." in f:
+            raise HLError(f"invalid path '{f}' in manifest")
+
+    arch = ssh(cfg, h, "uname -m").strip()
+    platform = ARCH_PLATFORM.get(arch)
+    if not platform:
+        raise HLError(f"unsupported architecture on {hostname}: {arch}")
+
+    with tempfile.TemporaryDirectory(prefix="hl-build-") as tmp:
+        archive = subprocess.Popen(["git", "-C", str(top), "archive", commit, *([subdir] if subdir else [])],
+                                   stdout=subprocess.PIPE)
+        run(["tar", "-x", "-C", tmp], stdin=archive.stdout, capture_output=False)
+        archive.wait()
+        if archive.returncode != 0:
+            raise HLError(f"git archive {commit[:12]} failed")
+        ctx = Path(tmp) / subdir if subdir else Path(tmp)
+        compose_text = None
+        if remote_compose:
+            cpath = ctx / remote_compose
+            if not cpath.is_file():
+                raise HLError(f"{remote_compose} is not in commit {commit[:12]} (commit it first)")
+            compose_text = cpath.read_text()
+            if f"image: {image}" not in compose_text and f"image: {image.removesuffix(':latest')}" not in compose_text:
+                raise HLError(f"{remote_compose} must run the image hl builds: add `image: {image}` to the service "
+                              f"(build=local never builds on the host)")
+        if not (ctx / dockerfile).is_file():
+            raise HLError(f"{dockerfile} is not in commit {commit[:12]}")
+        build = ["docker", "build", "--quiet", "--platform", platform, "-f", str(ctx / dockerfile), "-t", image, "-t", commit_tag]
+        build += [f"--build-arg={b}" for b in m.get("build_args", [])]
+        if DRY_RUN:
+            log(f"[dry-run] {' '.join(build)} <export of {commit[:12]}>")
+        else:
+            log(f"building {name}@{commit[:7]} for {platform} on this machine ...")
+            r = subprocess.run([*build, str(ctx)], stdout=sys.stderr if not JSON_OUT else subprocess.DEVNULL,
+                               stderr=subprocess.STDOUT)
+            if r.returncode != 0:
+                raise HLError("docker build failed (run without --json to see the output)")
+    steps.append({"step": "build", "platform": platform, "image": image, "tag": commit_tag})
+
+    # stream the image: docker save | gzip | ssh 'gunzip | docker load'
+    if DRY_RUN:
+        log(f"[dry-run] docker save {commit_tag} {image} | gzip | ssh {ssh_target(h)} 'gunzip | docker load'")
+    else:
+        log(f"sending image to {hostname} ...")
+        save = subprocess.Popen(["docker", "save", commit_tag, image], stdout=subprocess.PIPE)
+        gz = subprocess.Popen(["gzip", "-1"], stdin=save.stdout, stdout=subprocess.PIPE)
+        save.stdout.close()
+        load = subprocess.run(["ssh", *ssh_opts(cfg, h), ssh_target(h), "gunzip | docker load"],
+                              stdin=gz.stdout, capture_output=True, text=True)
+        gz.stdout.close()
+        if save.wait() != 0 or gz.wait() != 0 or load.returncode != 0:
+            raise HLError(f"image transfer failed: {(load.stderr or load.stdout).strip()[-1000:]}")
+    steps.append({"step": "transfer", "to": hostname})
+
+    ssh(cfg, h, f"mkdir -p \"$HOME/{remote}\"", mutating=True)
+    if compose_text is not None:
+        ssh(cfg, h, f"cat > \"$HOME/{remote}/docker-compose.yml\"", stdin=compose_text, mutating=True)
+    env_files = local_env_files(Path(top) / subdir if subdir else Path(top), m.get("env_files"))
+    for p in env_files:
+        ssh(cfg, h, f"umask 077; cat > \"$HOME/{remote}/{p.name}\"", stdin=p.read_text(), mutating=True)
+    if env_files:
+        steps.append({"step": "env", "files": [p.name for p in env_files]})
+
+    if compose_text is not None:
+        services = " ".join(q(x) for x in m.get("services", []))
+        # a standalone container from an earlier Dockerfile-only deploy would hold the ports
+        up = (f"docker rm -f {q(name)} >/dev/null 2>&1 || true\n"
+              f"docker compose -p {q(name)} -f docker-compose.yml up -d --no-build --remove-orphans {services}".strip())
+        logs_cmd = f"cd \"$HOME/{remote}\" && docker compose -p {q(name)} logs --no-color"
+    else:
+        if len(routes) > 1:
+            raise HLError("Dockerfile-only deploy supports a single route; use compose for more")
+        port = m.get("port") or next(iter(routes.values()), None)
+        if not port:
+            raise HLError("Dockerfile-only deploy needs a port: --route sub=PORT or manifest 'port'")
+        cport = m.get("container_port", port)
+        bind = m.get("bind", "127.0.0.1" if h.get("service_host") in ("localhost", "127.0.0.1") else "0.0.0.0")
+        if bind not in ("0.0.0.0", "127.0.0.1"):
+            raise HLError("manifest 'bind' must be 0.0.0.0 or 127.0.0.1")
+        if bind == "127.0.0.1" and routes and h.get("service_host") not in ("localhost", "127.0.0.1"):
+            raise HLError(f"bind 127.0.0.1 would hide the app from the tunnel connector, which reaches "
+                          f"{hostname} over the network; drop 'bind' or set the host's service_host to localhost")
+        envf = "--env-file .env" if any(p.name == ".env" for p in env_files) else ""
+        up = (f"docker rm -f {q(name)} >/dev/null 2>&1 || true\n"
+              f"docker compose -p {q(name)} down --remove-orphans >/dev/null 2>&1 || true\n"
+              f"docker run -d --name {q(name)} --restart unless-stopped {limit_flags(m)} {envf} "
+              f"-p {bind}:{int(port)}:{int(cport)} {q(image)}")
+        logs_cmd = f"docker logs {q(name)}"
+    ssh(cfg, h, f"set -e\ncd \"$HOME/{remote}\"\n{up}\n", mutating=True)
+    steps.append({"step": "run", "command": up})
+    return steps, up, remote, logs_cmd, image, repo_img
+
+
+def prune_images(cfg, h, repo_img, keep_commits, current):
+    """Keep the per-commit tags that rollback may need; untag the rest and drop dangling layers."""
+    keep = {c[:12] for c in keep_commits} | {current[:12]}
+    tags = ssh(cfg, h, f"docker image ls {shlex.quote(repo_img)} --format '{{{{.Tag}}}}'", check=False).split()
+    old = [t for t in tags if re.fullmatch(r"[0-9a-f]{12}", t) and t not in keep]
+    if old:
+        ssh(cfg, h, " ".join(f"docker image rm {shlex.quote(f'{repo_img}:{t}')} >/dev/null;" for t in old)
+            + " docker image prune -f >/dev/null", check=False, mutating=True)
+    return old
+
+
+def cmd_deploy(cfg, a):
+    src = Path(a.path).resolve()
+    if not src.is_dir():
+        raise HLError(f"not a directory: {src}")
+    m = load_manifest(src)
+    name = a.name or m.get("name") or src.name.lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        raise HLError(f"invalid app name '{name}' (lowercase letters, digits, - and _)")
+    hostname, h = host_cfg(cfg, a.host or m.get("host"))
+    compose = a.compose or m.get("compose")
+    routes = dict(m.get("routes", {}))
+    for r in a.route or []:
+        sub, _, port = r.partition("=")
+        if not port.isdigit():
+            raise HLError(f"--route must be SUB=PORT, got '{r}'")
+        routes[sub] = int(port)
+    if not compose:
+        compose = next((c for c in ("docker-compose.prod.yml", "compose.prod.yaml", "docker-compose.yml",
+                                    "compose.yaml", "compose.yml") if (src / c).exists()), None)
+    mode = a.build or m.get("build") or h.get("build") or "remote"
+    if mode not in ("remote", "local"):
+        raise HLError(f"build must be 'remote' or 'local', got '{mode}'")
+    if mode == "local" and m.get("remote_compose"):
+        compose = m["remote_compose"]
+    if not compose and not (src / m.get("dockerfile", "Dockerfile")).exists():
+        raise HLError("no compose file or Dockerfile found; add one or pass --compose")
+    watch = a.watch if a.watch is not None else m.get("watch", False)
+    if mode == "local" and watch:
+        raise HLError("--watch needs build=remote: with build=local the host has no repo to poll")
+    remote = m.get("remote_dir") or app_dir(cfg, name)
+    if not SAFE_PATH_RE.fullmatch(remote) or ".." in remote or remote.startswith("/"):
+        raise HLError(f"remote_dir must be a path relative to the home directory, got '{remote}'")
+
+    # ---- 1. local preflight: git repo on GitHub; decide the commit (push only from the target branch)
+    require("gh")
+    if git(src, "rev-parse", "--is-inside-work-tree", check=False) != "true":
+        raise HLError(f"{src} is not a git repo (run `git init` and commit first)")
+    top = Path(git(src, "rev-parse", "--show-toplevel"))
+    subdir = "" if top == src else src.relative_to(top).as_posix()  # monorepo app
+    branch = m.get("branch") or git(src, "rev-parse", "--abbrev-ref", "HEAD")
+    origin = git(src, "remote", "get-url", "origin", check=False)
+    steps = []
+    if not origin:
+        if not a.create_repo:
+            raise HLError("no `origin` remote. Re-run with --create-repo to create a private GitHub repo via gh")
+        if DRY_RUN:
+            log(f"[dry-run] gh repo create {name} --private --source {src} --push")
+            origin = f"git@github.com:OWNER/{name}.git"
+        else:
+            run(["gh", "repo", "create", name, "--private", "--source", str(src), "--remote", "origin", "--push"])
+            origin = git(src, "remote", "get-url", "origin")
+        steps.append({"step": "github", "created": origin})
+    repo = github_repo(origin)
+    sha, pushed = sync_branch(src, branch, a)
+    commit = sha[:7]
+    steps.append({"step": "push" if pushed else "source", "repo": repo, "branch": branch, "commit": commit})
+
+    # ---- 2. build, ship and start
+    previous = read_state(cfg, h, name)
+    image = repo_img = None
+    if mode == "remote":
+        more, up, workdir, logs_cmd = deploy_remote(cfg, h, hostname, src, subdir, name, branch, repo, sha,
+                                                    compose, m, routes, watch, remote)
+    else:
+        more, up, workdir, logs_cmd, image, repo_img = deploy_local(cfg, h, hostname, top, subdir, name, sha,
+                                                                    compose, m, routes, remote)
+    steps += more
+
+    # ---- 3. health on the host itself, then publish and check the public URL
+    ports = sorted(set(routes.values())) or ([m["port"]] if m.get("port") else [])
+    local_checks = [] if a.no_check else vm_health(cfg, h, name, ports, m.get("health_path", "/"), logs_cmd)
+
+    history = [e for e in previous.get("history", []) if e.get("commit") != sha]
+    history.insert(0, {"commit": sha, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    keep = int(m.get("keep_images", 5))
+    state = {"name": name, "mode": mode, "dir": workdir, "branch": branch, "commit": sha, "image": image,
+             "up": up, "ports": ports, "health_path": m.get("health_path", "/"), "history": history[:max(keep, 1)]}
+    write_state(cfg, h, name, state, f"deployed {sha[:7]} ({mode})")
+    if mode == "local":
+        pruned = prune_images(cfg, h, repo_img, [e["commit"] for e in state["history"]], sha)
+        if pruned:
+            steps.append({"step": "prune", "removed_tags": pruned})
+
     published = [do_expose(cfg, sub, hostname, port, force=a.force) for sub, port in routes.items()]
 
-    # ---- 6. smoke test
     checks = []
     if not DRY_RUN and not a.no_check:
         health = "/" + m.get("health_path", "/").lstrip("/")
@@ -610,16 +922,113 @@ echo ok
             checks.append({"url": p["url"] + health, "status": code})
 
     ok = all(c["status"][:1] in ("2", "3", "4") and c["status"] != "404" for c in checks)
-    res = {"ok": ok, "name": name, "host": hostname, "commit": commit, "steps": steps,
-           "routes": published, "checks": checks, "dry_run": DRY_RUN}
-    human = [f"deployed {name}@{commit} ({repo}:{branch}) to {hostname}:~/{remote}"
+    res = {"ok": ok, "name": name, "host": hostname, "build": mode, "commit": commit, "steps": steps,
+           "local_checks": local_checks, "routes": published, "checks": checks, "dry_run": DRY_RUN}
+    human = [f"deployed {name}@{commit} ({repo}:{branch}, build={mode}) to {hostname}:~/{workdir}"
              + ("  [dry-run]" if DRY_RUN else "")]
-    human += [f"  {p['url']} -> {p['service']}" for p in published]
+    human += [f"  host check 127.0.0.1:{c['port']}: HTTP {c['status']}" for c in local_checks]
+    for p in published:
+        moved = f"  (moved from {p['moved_from']['service']})" if p["moved_from"] else ""
+        human.append(f"  {p['url']} -> {p['service']}{moved}")
     human += [f"  check {c['url']}: HTTP {c['status']}" for c in checks]
     if watch:
         human.append("  auto-redeploy on push: enabled")
     emit(res, "\n".join(human))
     return 0 if ok else 2
+
+
+def cmd_rollback(cfg, a):
+    """build=local only: restart a previous commit's image, which is still on the host."""
+    hostname, h = host_cfg(cfg, a.host)
+    st = read_state(cfg, h, a.name)
+    if not st:
+        raise HLError(f"no deploy record for {a.name} on {hostname} (~/.hl/apps/{a.name}.json)")
+    hist = st.get("history", [])
+    if a.list:
+        emit({"name": a.name, "host": hostname, "current": st["commit"], "history": hist},
+             "\n".join(f"{'*' if e['commit'] == st['commit'] else ' '} {e['commit'][:12]}  {e['at']}" for e in hist))
+        return 0
+    if st.get("mode") != "local":
+        raise HLError("rollback needs build=local (per-commit images). For build=remote, revert the commit and deploy")
+    if a.to:
+        target = next((e["commit"] for e in hist if e["commit"].startswith(a.to)), None)
+        if not target:
+            raise HLError(f"{a.to} is not in the kept history (see `hl rollback {a.name} --list`)")
+    else:
+        older = [e["commit"] for e in hist if e["commit"] != st["commit"]]
+        if not older:
+            raise HLError("no previous release kept on the host")
+        target = older[0]
+    image = st["image"]
+    repo_img = image.rsplit(":", 1)[0]
+    q = shlex.quote
+    ssh(cfg, h, f"set -e\ndocker tag {q(f'{repo_img}:{target[:12]}')} {q(image)}\ncd \"$HOME/{st['dir']}\"\n{st['up']}\n",
+        mutating=True)
+    logs_cmd = (f"cd \"$HOME/{st['dir']}\" && docker compose -p {q(a.name)} logs --no-color"
+                if "docker compose" in st["up"] else f"docker logs {q(a.name)}")
+    checks = vm_health(cfg, h, a.name, st.get("ports", []), st.get("health_path", "/"), logs_cmd)
+    st["commit"] = target
+    write_state(cfg, h, a.name, st, f"rolled back to {target[:7]}")
+    emit({"name": a.name, "host": hostname, "commit": target, "local_checks": checks, "dry_run": DRY_RUN},
+         f"{a.name} on {hostname} now runs {target[:7]}" + ("  [dry-run]" if DRY_RUN else ""))
+
+
+def parse_location(cfg, loc):
+    """host:path or host:volume:NAME -> (hostname, h, kind, value)."""
+    hostname, sep, rest = loc.partition(":")
+    if not sep or not rest:
+        raise HLError(f"expected HOST:PATH or HOST:volume:NAME, got '{loc}'")
+    hostname, h = host_cfg(cfg, hostname)
+    if rest.startswith("volume:"):
+        vol = rest[len("volume:"):]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", vol):
+            raise HLError(f"invalid volume name '{vol}'")
+        return hostname, h, "volume", vol
+    if not re.fullmatch(r"~?[A-Za-z0-9._/-]+", rest) or ".." in rest:
+        raise HLError(f"invalid path '{rest}'")
+    path = "$HOME/" + rest[2:] if rest.startswith("~/") else rest if rest.startswith("/") else "$HOME/" + rest
+    return hostname, h, "path", path
+
+
+def cmd_copy_data(cfg, a):
+    """Stream a directory or Docker volume from one host to another through this machine
+    (tar | gzip over SSH). Stop the app on the source first so the copy is consistent."""
+    sname, sh_, skind, sval = parse_location(cfg, a.source)
+    dname, dh, dkind, dval = parse_location(cfg, a.dest)
+    alpine = "mirror.gcr.io/library/alpine:3"
+    if skind == "path":
+        read = f"cd \"{sval}\" && tar -cf - . | gzip -1"
+    else:
+        read = f"docker run --rm -v {sval}:/v:ro {alpine} tar -C /v -cf - . | gzip -1"
+    if dkind == "path":
+        empty = f"[ ! -e \"{dval}\" ] || [ -z \"$(ls -A \"{dval}\")\" ]"
+        write = f"mkdir -p \"{dval}\" && gunzip | tar -C \"{dval}\" -xpf -"
+    else:
+        empty = (f"! docker volume inspect {dval} >/dev/null 2>&1 || "
+                 f"docker run --rm -v {dval}:/v {alpine} sh -c '[ -z \"$(ls -A /v)\" ]'")
+        write = f"docker volume create {dval} >/dev/null && gunzip | docker run --rm -i -v {dval}:/v {alpine} tar -C /v -xpf -"
+    if not a.force and ssh(cfg, dh, f"{empty} && echo empty || echo notempty", check=False).strip() != "empty":
+        raise HLError(f"{a.dest} is not empty (use --force to copy into it anyway)")
+    if DRY_RUN:
+        log(f"[dry-run] ssh {sname} '{read}' | ssh {dname} '{write}'")
+        emit({"source": a.source, "dest": a.dest, "dry_run": True}, f"would copy {a.source} -> {a.dest}  [dry-run]")
+        return 0
+    src_p = subprocess.Popen(["ssh", *ssh_opts(cfg, sh_), ssh_target(sh_), read], stdout=subprocess.PIPE)
+    dst_p = subprocess.Popen(["ssh", *ssh_opts(cfg, dh), ssh_target(dh), write], stdin=subprocess.PIPE)
+    sent, last = 0, time.time()
+    while chunk := src_p.stdout.read(1 << 20):
+        dst_p.stdin.write(chunk)
+        sent += len(chunk)
+        if not JSON_OUT and time.time() - last > 2:
+            print(f"\rhl: {sent / 1e6:,.1f} MB compressed", end="", file=sys.stderr)
+            last = time.time()
+    dst_p.stdin.close()
+    if not JSON_OUT:
+        print(file=sys.stderr)
+    if src_p.wait() != 0 or dst_p.wait() != 0:
+        raise HLError(f"copy failed (source exit {src_p.returncode}, destination exit {dst_p.returncode})")
+    emit({"source": a.source, "dest": a.dest, "compressed_bytes": sent},
+         f"copied {a.source} -> {a.dest} ({sent / 1e6:,.1f} MB compressed)")
 
 
 def cmd_unwatch(cfg, a):
@@ -632,7 +1041,8 @@ def cmd_logs(cfg, a):
     hostname, h = host_cfg(cfg, a.host)
     q = shlex.quote
     if a.deploy:
-        cmd = f"tail -n {a.tail} \"$HOME/{app_dir(cfg, a.name)}/.git/hl/deploy.log\" 2>&1"
+        cmd = (f"tail -n {a.tail} \"$HOME/.hl/apps/{a.name}.log\" 2>/dev/null; "
+               f"tail -n {a.tail} \"$HOME/{app_dir(cfg, a.name)}/.git/hl/deploy.log\" 2>/dev/null; true")
     else:
         cmd = (f"if [ -n \"$(docker compose -p {q(a.name)} ps -aq 2>/dev/null)\" ]; then "
                f"docker compose -p {q(a.name)} logs --no-color --tail {a.tail} {q(a.service) if a.service else ''}; "
@@ -655,8 +1065,8 @@ def cmd_ssh_config(cfg, a):
     lines = []
     for name, h in cfg["hosts"].items():
         lines += [f"Host {name}", f"  HostName {h['ip']}", f"  User {h['user']}"]
-        if cfg.get("jump"):
-            lines.append(f"  ProxyJump {cfg['jump']}")
+        if host_jump(cfg, h):
+            lines.append(f"  ProxyJump {host_jump(cfg, h)}")
         lines.append("")
     print("\n".join(lines))
 
@@ -666,7 +1076,7 @@ def cmd_exec(cfg, a):
     command = a.command[1:] if a.command[:1] == ["--"] else a.command
     if not command:
         raise HLError("usage: hl exec --host H -- COMMAND")
-    return subprocess.run(["ssh", *ssh_opts(cfg), ssh_target(h), " ".join(command)]).returncode
+    return subprocess.run(["ssh", *ssh_opts(cfg, h), ssh_target(h), " ".join(command)]).returncode
 
 
 # ---------------------------------------------------------------- main
@@ -708,7 +1118,7 @@ def main(argv=None):
     s.add_argument("name")
     s.add_argument("--keep-dns", action="store_true")
 
-    s = sub.add_parser("deploy", parents=[common], help="push to GitHub, pull on the VM, docker up, publish routes")
+    s = sub.add_parser("deploy", parents=[common], help="build and start an app on a host, publish its routes")
     s.add_argument("path", nargs="?", default=".")
     s.add_argument("--name", help="app/compose project name (default: manifest name or dir name)")
     s.add_argument("--host")
@@ -719,7 +1129,22 @@ def main(argv=None):
     s.add_argument("--create-repo", action="store_true", help="create a private GitHub repo if there is no origin")
     s.add_argument("--allow-dirty", action="store_true", help="deploy last commit even with uncommitted changes")
     s.add_argument("--force", action="store_true", help="repoint existing hostnames / replace DNS records")
-    s.add_argument("--no-check", action="store_true", help="skip https smoke test")
+    s.add_argument("--no-check", action="store_true", help="skip the health checks")
+    s.add_argument("--build", choices=["remote", "local"],
+                   help="where the image is built (default: manifest, then host config, then remote)")
+    s.add_argument("--no-push", action="store_true", help="deploy origin/<branch> as it is, push nothing")
+
+    s = sub.add_parser("rollback", parents=[common], help="build=local: run a previous release again")
+    s.add_argument("name")
+    s.add_argument("--host")
+    s.add_argument("--to", metavar="COMMIT", help="commit prefix (default: the previous release)")
+    s.add_argument("--list", action="store_true", help="show the releases kept on the host")
+
+    s = sub.add_parser("copy-data", parents=[common],
+                       help="copy a directory or volume between hosts (HOST:PATH or HOST:volume:NAME)")
+    s.add_argument("source")
+    s.add_argument("dest")
+    s.add_argument("--force", action="store_true", help="copy even if the destination is not empty")
 
     s = sub.add_parser("unwatch", parents=[common], help="disable auto-redeploy on push")
     s.add_argument("name")
