@@ -555,7 +555,9 @@ def up_command(src, name, compose, m, routes):
     q = shlex.quote
     if compose:
         services = " ".join(q(s) for s in m.get("services", []))
-        return f"docker compose -p {q(name)} -f {q(compose)} up -d --build --remove-orphans {services}".strip()
+        # build --pull first: re-fetch the base images so each deploy picks up their security patches
+        base = f"docker compose -p {q(name)} -f {q(compose)}"
+        return f"{base} build --pull {services}".strip() + f" && {base} up -d --build --remove-orphans {services}".rstrip()
     if len(routes) > 1:
         raise HLError("Dockerfile-only deploy supports a single route; use compose for more")
     port = m.get("port") or next(iter(routes.values()), None)
@@ -563,7 +565,7 @@ def up_command(src, name, compose, m, routes):
         raise HLError("Dockerfile-only deploy needs a port: --route sub=PORT or manifest 'port'")
     cport = m.get("container_port", port)
     envf = "--env-file .env" if (src / ".env").exists() else ""
-    return (f"docker build -t {q(name)}:latest .\n"
+    return (f"docker build --pull -t {q(name)}:latest .\n"
             f"docker rm -f {q(name)} >/dev/null 2>&1 || true\n"
             f"docker run -d --name {q(name)} --restart unless-stopped {limit_flags(m)} {envf} -p {int(port)}:{int(cport)} {q(name)}:latest")
 
@@ -746,7 +748,7 @@ def deploy_local(cfg, h, hostname, top, subdir, name, commit, compose, m, routes
                               f"(build=local never builds on the host)")
         if not (ctx / dockerfile).is_file():
             raise HLError(f"{dockerfile} is not in commit {commit[:12]}")
-        build = ["docker", "build", "--quiet", "--platform", platform, "-f", str(ctx / dockerfile), "-t", image, "-t", commit_tag]
+        build = ["docker", "build", "--quiet", "--pull", "--platform", platform, "-f", str(ctx / dockerfile), "-t", image, "-t", commit_tag]
         build += [f"--build-arg={b}" for b in m.get("build_args", [])]
         if DRY_RUN:
             log(f"[dry-run] {' '.join(build)} <export of {commit[:12]}>")
