@@ -208,6 +208,7 @@ Global flags, before or after the command: `--json`, `--dry-run`.
 | `remote_compose` | local | compose file sent to the server, read from the deployed commit; it must use `image:` and no `build:` |
 | `dockerfile` | local | Dockerfile path (default `Dockerfile`) |
 | `build_args` | local | list of `KEY=VALUE` passed as `--build-arg` |
+| `pull` | both | `true`: pull fresh base images on every build, so a floating tag like `node:24-slim` picks up its security patches (default off: cached base images are reused) |
 | `keep_images` | local | releases kept for rollback (default 5) |
 | `watch` | remote | poll GitHub from cron and redeploy on push |
 | `ignore` | remote | globs whose changes don't trigger an auto-redeploy, e.g. `["docs/**", "*.md"]`; `*` also matches `/` |
